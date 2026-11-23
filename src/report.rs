@@ -660,6 +660,19 @@ pub fn startup_lines(findings: &mut [Finding], home: &Path) {
 /// The why of a startup line whose PATH folder takes over trusted commands, followed by them.
 pub const TAKES_OVER: &str = "puts its own commands first in PATH, in place of: ";
 
+/// Drops what reached the fake home from the host, not from the sandbox: the machine's file indexer (updatedb), a
+/// backup (rsync) or a search tool walking ~/.local/share sets off the same file events as the program would. With
+/// the tracer running and nothing lost, every open made inside the sandbox is seen, folders included: a bait touched
+/// with no opener inside was touched from outside. Returns how many findings were dropped.
+pub fn from_outside(findings: &mut Vec<Finding>, a: &Activity) -> usize {
+    if a.lost {
+        return 0;
+    }
+    let before = findings.len();
+    findings.retain(|f| !(f.kind == Kind::Secret && f.path.starts_with('~') && f.by.is_empty()));
+    before - findings.len()
+}
+
 /// How a shell would need the argument written: what the report shows must be what ran.
 fn quote(a: &str) -> String {
     let plain = !a.is_empty()
@@ -720,6 +733,8 @@ pub struct Report<'a> {
     pub exploration: Option<Exploration<'a>>,
     /// What the program set up to come back, set off once by chouf (persist.rs).
     pub triggered: &'a [Done],
+    /// Bait touches that came from the host, not the sandbox (from_outside), left out.
+    pub outside: usize,
 }
 
 impl Report<'_> {
@@ -728,7 +743,7 @@ impl Report<'_> {
         json!({
             "session": self.id, "image": self.image, "command": self.cmd,
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
-            "watch_incomplete": self.incomplete, "temporary_files": self.transient,
+            "watch_incomplete": self.incomplete, "temporary_files": self.transient, "touched_from_outside": self.outside,
             "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count, "package": f.package, "lines": f.lines})).collect::<Vec<_>>(),
             "activity": match &self.activity {
                 Ok(a) => {
@@ -916,6 +931,9 @@ impl Report<'_> {
         }
         if self.transient > 0 {
             s += &format!("\n{}\n", tf("({} temporary files or folders created and removed in ~)", &[&self.transient.to_string()]));
+        }
+        if self.outside > 0 {
+            s += &format!("\n{}\n", tf("({} baits touched from your own machine during the run, not from the sandbox: left out)", &[&self.outside.to_string()]));
         }
         if self.incomplete {
             s += &format!("\n{}\n", t("Warning: some file events were lost, this list may be incomplete."));
@@ -1195,5 +1213,28 @@ mod tests {
         let f = vec![Finding { kind: Kind::Secret, path: "~/.ssh/id_ed25519".into(), did: vec!["read"], why: String::new(), by: vec![], group: crate::canary::PRIVATE, count: 1, package: String::new(), lines: vec![] }];
         let s = in_short(&f, Some(&a), &cans, None);
         assert!(s.contains("After reading your secrets it sent 2.0 KB to 10.0.0.2.") && !s.contains("10.0.0.1."), "{s}");
+    }
+
+    #[test]
+    fn baits_touched_from_the_host_are_left_out_unless_the_tracer_lost_events() {
+        use serde_json::json;
+        let cans = vec![
+            Canary { path: ".aws/credentials".into(), what: "AWS access keys", group: crate::canary::DEV, mark: String::new() },
+            Canary { path: ".ssh/id_ed25519".into(), what: "SSH private key", group: crate::canary::PRIVATE, mark: String::new() },
+        ];
+        // updatedb on the host lists ~/.aws; the program inside reads the SSH key
+        let home = touches(&[(".aws", &[Op::List]), (".ssh/id_ed25519", &[Op::Open, Op::Read])]);
+        let events = vec![
+            json!({"kind":"exec","t":1,"pid":5,"ppid":1,"comm":"cat","file":"/usr/bin/cat","args":["cat","/root/.ssh/id_ed25519"]}),
+            json!({"kind":"open","t":2,"pid":5,"comm":"cat","path":"/root/.ssh/id_ed25519","mode":"read","create":false}),
+        ];
+        for (lost, kept) in [(false, vec!["~/.ssh/id_ed25519"]), (true, vec!["~/.aws", "~/.ssh/id_ed25519"])] {
+            let a = Activity::from_events(&events, lost);
+            let mut f = findings(&cans, &home, &FsDiff::default(), &Packages::default());
+            attribute(&mut f, &a, &FsDiff::default());
+            let dropped = from_outside(&mut f, &a);
+            let paths: Vec<&str> = f.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!((paths, dropped), (kept, if lost { 0 } else { 1 }));
+        }
     }
 }

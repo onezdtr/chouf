@@ -304,8 +304,10 @@ fn conclude<'e>(
     fs::write(s.dir.join("stdout"), &outcome.stdout)?;
     fs::write(s.dir.join("stderr"), &outcome.stderr)?;
     let mut findings = report::findings(&s.canaries, &touches, &outcome.fs, &pk);
+    let mut outside = 0;
     if let Ok(a) = &activity {
         report::attribute(&mut findings, a, &outcome.fs);
+        outside = report::from_outside(&mut findings, a);
     }
     report::startup_lines(&mut findings, &s.home);
     let seen = explore::observed(activity.as_ref().ok(), &activity.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
@@ -324,6 +326,7 @@ fn conclude<'e>(
             canaries: &s.canaries,
             exploration,
             triggered,
+            outside,
         },
     )
 }

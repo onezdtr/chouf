@@ -70,6 +70,8 @@ const FR: &[(&str, &str)] = &[
      "Il ajoute {} à ton PATH (dans {}) : normal pour un installeur de commandes."),
     ("take out the lines it added to {} (shown below)", "retire les lignes qu'il a ajoutées à {} (montrées plus bas)"),
     ("package {}", "paquet {}"),
+    ("({} baits touched from your own machine during the run, not from the sandbox: left out)",
+     "({} faux secrets touchés par ta propre machine pendant le test, pas par le bac à sable : écartés)"),
     ("(+{} of its own programs)", "(+{} de ses propres programmes)"),
     ("adds to PATH: {}", "ajoute au PATH : {}"),
     ("puts its own commands first in PATH, in place of: {}", "met ses propres commandes en tête du PATH, à la place de : {}"),
