@@ -97,14 +97,16 @@ What it says vs what it does  (opinion of gemini-3.1-flash-lite, not a measureme
 - **inotify from the host**: the fake home is a bind mount, so every open, read, write, create and delete inside it is
   seen from outside, without root, including files written into folders created a microsecond earlier.
 
-## Install the kernel tracer (optional)
+## Install
 
 ```
-sudo ./trace/install.sh      # builds as you, installs /usr/local/bin/chouf-trace and chouf-trace.service
+curl -fsSL https://raw.githubusercontent.com/onezdtr/chouf/main/get.sh | sudo sh    # latest release, x86_64 or aarch64
 ```
 
-Needs Linux 5.11+ with BTF (`/sys/kernel/btf/vmlinux`), clang and bpftool to build. Without it, chouf still reports
-what was touched, without saying by whom or where it connected.
+Or from the source tree: `./install.sh` (chouf alone, in `~/.local/bin`) or `sudo ./install.sh` (chouf and its kernel
+tracer, `chouf-trace`, as a system service). chouf needs rootless podman. The tracer needs Linux 5.11+ with BTF; to
+build it, clang and bpftool. Without the tracer, chouf still reports what was touched, but not by whom, not where it
+connected, without the local-network guard and without proof of what left the machine.
 
 ## Usage
 
