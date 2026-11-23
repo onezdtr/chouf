@@ -99,6 +99,8 @@ What it says vs what it does  (opinion of gemini-3.1-flash-lite, not a measureme
 
 ## Install
 
+Website: https://onezdtr.github.io/chouf
+
 ```
 curl -fsSL https://raw.githubusercontent.com/onezdtr/chouf/main/get.sh | sudo sh    # latest release, x86_64 or aarch64
 ```
