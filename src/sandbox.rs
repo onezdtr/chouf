@@ -281,6 +281,21 @@ impl Live<'_> {
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Copies a folder of the machine into `dest` (same path below it), from outside: nothing runs inside, so the
+    /// tracer sees nothing of it. A missing folder is not an error: there is just nothing to copy.
+    pub fn copy_out(&self, path: &str, dest: &Path) {
+        let to = dest.join(path.trim_start_matches('/'));
+        if let Some(parent) = to.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = Command::new("podman")
+            .args(["cp", &format!("{}:{path}", self.spec.name), &to.to_string_lossy()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     /// True while the machine still runs (a timed-out command stops it).
     pub fn alive(&self) -> bool {
         podman(&["inspect", "--format", "{{.State.Running}}", &self.spec.name])

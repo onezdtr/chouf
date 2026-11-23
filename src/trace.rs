@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Programs kept in the tree (report.json and the report). A package manager alone runs hundreds of them.
+const MAX_PROGRAMS: usize = 5000;
+
 pub const SOCK: &str = "/run/chouf-trace.sock";
 const MAX_EVENTS: usize = 500_000;
 
@@ -122,6 +125,8 @@ pub struct Open {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conn {
+    /// When it was opened.
+    pub t: i64,
     pub pid: u32,
     pub proto: &'static str,
     pub ip: String,
@@ -219,7 +224,7 @@ impl Activity {
                         continue; // a DNS question: its answer names the next connections instead
                     }
                     if seen_conns.insert((pid, ip.clone(), port, k)) {
-                        a.conns.push(Conn { pid, proto: if k == "connect" { "tcp" } else { "udp" }, name: names.get(&ip).cloned(), ip, port, sent: 0, received: 0 });
+                        a.conns.push(Conn { t, pid, proto: if k == "connect" { "tcp" } else { "udp" }, name: names.get(&ip).cloned(), ip, port, sent: 0, received: 0 });
                     }
                 }
                 Some("close") => {
@@ -375,7 +380,7 @@ impl Activity {
         let mut stack: Vec<(u32, usize)> = roots.into_iter().rev().map(|p| (p, 0)).collect();
         let mut visited = BTreeSet::new();
         while let Some((pid, depth)) = stack.pop() {
-            if !visited.insert(pid) || out.len() >= 400 {
+            if !visited.insert(pid) || out.len() >= MAX_PROGRAMS {
                 continue;
             }
             let p = &self.procs[&pid];

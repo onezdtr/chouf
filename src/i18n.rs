@@ -57,6 +57,22 @@ const FR: &[(&str, &str)] = &[
      "Il a lu certains de ses propres réglages ({}) : normal, rien d'autre n'y a touché."),
     ("It read one of its own settings ({}): normal, nothing else touched it.",
      "Il a lu un de ses propres réglages ({}) : normal, rien d'autre n'y a touché."),
+    ("It was stopped at the time limit: what it would have done next was not seen.",
+     "Il a été arrêté à la limite de temps : la suite de ce qu'il aurait fait n'a pas été vue."),
+    ("It stopped on an error (exit {}): what it would have done next was not seen.",
+     "Il s'est arrêté sur une erreur (exit {}) : la suite de ce qu'il aurait fait n'a pas été vue."),
+    ("Its last message: {}", "Son dernier message : {}"),
+    ("It added a software source: {}. What comes from there will be installed like the system's own updates.",
+     "Il a ajouté une source de logiciels : {}. Ce qui vient de là s'installera comme les mises à jour du système."),
+    ("Packages it installed will start with the machine: {} (normal for this kind of software).",
+     "Des paquets qu'il a installés démarreront avec la machine : {} (normal pour ce genre de logiciel)."),
+    ("It adds {} to your PATH (in {}): normal for an installer of commands.",
+     "Il ajoute {} à ton PATH (dans {}) : normal pour un installeur de commandes."),
+    ("take out the lines it added to {} (shown below)", "retire les lignes qu'il a ajoutées à {} (montrées plus bas)"),
+    ("package {}", "paquet {}"),
+    ("(+{} of its own programs)", "(+{} de ses propres programmes)"),
+    ("adds to PATH: {}", "ajoute au PATH : {}"),
+    ("puts its own commands first in PATH, in place of: {}", "met ses propres commandes en tête du PATH, à la place de : {}"),
     ("It installed software with the system's package manager (normal for an installer).",
      "Il a installé des logiciels avec le gestionnaire de paquets du système (normal pour un installeur)."),
     ("It tried to reach your local network {} times (router, other machines): chouf refused. {}",
@@ -206,6 +222,11 @@ pub fn tf(en: &str, args: &[&str]) -> String {
 pub fn why(w: &str) -> String {
     if let Some(rest) = w.strip_prefix("looked inside the folder of: ") {
         return tf("looked inside the folder of: {}", &[&t(rest)]);
+    }
+    for prefix in [crate::report::PATH_ONLY, crate::report::TAKES_OVER] {
+        if let Some(rest) = w.strip_prefix(prefix) {
+            return tf(&format!("{prefix}{{}}"), &[rest]);
+        }
     }
     if let Some((what, tools)) = w.split_once(", read by its own tool: ") {
         return tf("{}, read by its own tool: {}", &[&t(what), tools]);

@@ -125,8 +125,25 @@ Each run is kept in `~/.local/share/chouf/sessions/<id>/` (`report.json`, `stdou
 
 ## Status
 
-Early. Done: sandbox, baits, file watching, kernel tracer (who did what, where it connected), the explorer and its
-verdict. Next: a plain-language report for non-experts, more baits (browsers, password managers, crypto wallets).
+Early, tested on real installers (rustup, get.docker.com, ollama). Done: sandbox, 38 baits, file watching, kernel
+tracer, local-network guard, proof of theft, setting off what a program left behind, the explorer and its verdict, a
+plain-language report in English and French.
+
+What a real installer does is not mistaken for an attack:
+
+- files, services and system accounts that come with packages **apt downloaded from a repository** are named as the
+  package's own (`package docker-ce`). A `.deb` the program brought itself is never excused, and a software source it
+  adds stays an alarm, with its address;
+- lines added to `~/.bashrc` or `~/.profile` are shown. Lines that only put a home folder in `PATH` (rustup's
+  `. "$HOME/.cargo/env"`) are ordinary, unless that folder holds a command people trust (`sudo`, `ssh`, `git`…).
+
+Known limits:
+
+- a determined program can still tell it is in a container (`/run/.containerenv`, an overlay root);
+- the sandbox has no running systemd: an installer that checks for it may skip its service (ollama's install script
+  does), and that part is not seen;
+- the proof of theft reads the first 512 bytes of each send, and nothing inside encrypted connections;
+- packages are recognised for Debian and Ubuntu images (dpkg) only.
 
 ## Related work
 

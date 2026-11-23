@@ -98,7 +98,11 @@ pub fn page(r: &Value, in_short: &str) -> String {
         h += &format!("<section><h2>{}</h2>", t(title));
         for f in list {
             let did: Vec<String> = f["did"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).map(|d| esc(&t(d))).collect();
-            let why = esc(&crate::i18n::why(f["why"].as_str().unwrap_or("")));
+            let mut notes: Vec<String> = f["why"].as_str().filter(|w| !w.is_empty()).map(crate::i18n::why).into_iter().collect();
+            if let Some(p) = f["package"].as_str().filter(|p| !p.is_empty()) {
+                notes.push(tf("package {}", &[p]));
+            }
+            let why = esc(&notes.join(" · "));
             h += &format!(
                 "<div class=\"f\"><span class=\"{}\">{}</span> <span class=\"path mono\">{}</span>{}",
                 if kind == "other" { "note" } else { "bad" },
@@ -106,6 +110,9 @@ pub fn page(r: &Value, in_short: &str) -> String {
                 match f["count"].as_u64() { Some(n) if n > 1 => tf("{} files in {}", &[&n.to_string(), &text(&f["path"])]), _ => text(&f["path"]) },
                 if why.is_empty() { String::new() } else { format!(" <span class=\"note\">({why})</span>") }
             );
+            for l in f["lines"].as_array().into_iter().flatten().take(4) {
+                h += &format!("<div class=\"by mono\">+ {}</div>", text(l));
+            }
             for b in f["by"].as_array().into_iter().flatten().take(if kind == "other" { 0 } else { 3 }) {
                 h += &format!("<div class=\"by mono\">{} {}</div>", t("by"), text(b));
             }

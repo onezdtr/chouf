@@ -3,6 +3,7 @@ mod explore;
 mod html;
 mod i18n;
 mod llm;
+mod packages;
 mod persist;
 mod report;
 mod sandbox;
@@ -173,7 +174,7 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
     let mut json = r.json();
     json["token"] = s.token.clone().into();
     fs::write(s.dir.join("report.json"), serde_json::to_vec_pretty(&json).map_err(io::Error::other)?)?;
-    let short = report::in_short(&r.findings, r.activity.as_ref().ok().copied(), r.canaries);
+    let short = report::in_short(&r.findings, r.activity.as_ref().ok().copied(), r.canaries, report::failure(r.outcome).as_deref());
     fs::write(s.dir.join("report.html"), html::page(&json, &short))?;
     print!("{}", r.text());
     println!("\nsession: {}  (report.html to share)", s.dir.display());
@@ -187,7 +188,7 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
 fn home_ways_back(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for rel in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".ssh/rc"] {
-        if let Ok(now) = fs::read_to_string(home.join(rel)) {
+        if let Some(now) = report::small_file(&home.join(rel)) {
             if canary::planted(rel) != Some(now.as_str()) {
                 out.push(format!("~/{rel}"));
             }
@@ -201,13 +202,30 @@ fn home_ways_back(home: &Path) -> Vec<String> {
     out
 }
 
-/// Sets off, once, what the program set up to come back (persist.rs), watched like the rest of the run.
-fn set_off(live: &sandbox::Live, s: &Session) -> io::Result<Vec<Done>> {
+/// What the package manager installed from a repository during the run (packages.rs), read while the machine runs.
+/// Without the tracer nothing can say how a package came: none is excused.
+fn packages(live: &sandbox::Live, s: &Session, changed: &[String], a: Option<&trace::Activity>) -> packages::Packages {
+    let Some(a) = a.filter(|_| changed.iter().any(|p| p.starts_with("/var/lib/dpkg/info/"))) else { return Default::default() };
+    let copy = s.dir.join(".system");
+    let _ = fs::remove_dir_all(&copy);
+    for p in packages::COPIED {
+        live.copy_out(p, &copy);
+    }
+    let pk = packages::Packages::load(&copy, changed, a);
+    let _ = fs::remove_dir_all(&copy);
+    pk
+}
+
+/// Sets off, once, what the program set up to come back (persist.rs), watched like the rest of the run. What a
+/// repository package set up (docker's service) is the package's, not the program's: it is left alone.
+fn set_off(live: &sandbox::Live, s: &Session, tracer: Option<&trace::Tracer>) -> io::Result<Vec<Done>> {
     if !live.alive() {
         return Ok(vec![]);
     }
     let sys = sandbox::interesting(live.diff_now()?, &s.noise);
-    let system: Vec<String> = sys.added.into_iter().chain(sys.changed).collect();
+    let mut system: Vec<String> = sys.added.into_iter().chain(sys.changed).collect();
+    let pk = packages(live, s, &system, tracer.map(|t| t.snapshot()).as_ref());
+    system.retain(|p| pk.of(p).is_none());
     let read = |p: &str| live.read_file(p);
     let mut done = Vec::new();
     for t in persist::plan(&home_ways_back(&s.home), &system, &read) {
@@ -267,6 +285,11 @@ fn conclude<'e>(
     triggered: &[Done],
 ) -> io::Result<ExitCode> {
     let init = m.live.init_pid;
+    // the system folders packages.rs reads are copied before the machine stops (and goes away)
+    let before = sandbox::interesting(m.live.diff_now().unwrap_or_default(), &s.noise);
+    let changed: Vec<String> = before.added.iter().chain(&before.changed).cloned().collect();
+    // a snapshot: the watch goes on until the machine is stopped, nothing it does in between goes unseen
+    let pk = packages(&m.live, s, &changed, m.tracer.as_ref().ok().map(|t| t.snapshot()).as_ref());
     let (fs_diff, elapsed) = m.live.finish()?;
     let touches = m.watcher.stop()?;
     let activity = m.tracer.map(|t| t.stop().without_tree(init).without_our_reads());
@@ -280,10 +303,11 @@ fn conclude<'e>(
     };
     fs::write(s.dir.join("stdout"), &outcome.stdout)?;
     fs::write(s.dir.join("stderr"), &outcome.stderr)?;
-    let mut findings = report::findings(&s.canaries, &touches, &outcome.fs);
+    let mut findings = report::findings(&s.canaries, &touches, &outcome.fs, &pk);
     if let Ok(a) = &activity {
         report::attribute(&mut findings, a, &outcome.fs);
     }
+    report::startup_lines(&mut findings, &s.home);
     let seen = explore::observed(activity.as_ref().ok(), &activity.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
     let exploration = judge.map(|j| j(&findings, &seen));
     finish(
@@ -321,7 +345,7 @@ fn run(o: Opts) -> io::Result<ExitCode> {
     let spec = spec(&o, &s, &keepalive);
     let m = machine(&o, &s, &spec)?;
     let first = run_step(&m.live, &o.cmd, "", "the command you asked to check", o.timeout)?;
-    let triggered = if first.timed_out { vec![] } else { set_off(&m.live, &s)? };
+    let triggered = if first.timed_out { vec![] } else { set_off(&m.live, &s, m.tracer.as_ref().ok())? };
     conclude(&o, &s, m, Some(&first), None, &triggered)
 }
 
@@ -393,7 +417,7 @@ fn explore(o: Opts) -> io::Result<ExitCode> {
             }
         }
     }
-    let triggered = if done.iter().any(|d| d.timed_out) { vec![] } else { set_off(&m.live, &s)? };
+    let triggered = if done.iter().any(|d| d.timed_out) { vec![] } else { set_off(&m.live, &s, m.tracer.as_ref().ok())? };
     let first = done.first().cloned();
     let all: Vec<Done> = done.iter().chain(&triggered).cloned().collect();
     let judge = |findings: &[report::Finding], seen: &str| {

