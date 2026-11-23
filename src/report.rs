@@ -288,6 +288,10 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
     if trust > 0 {
         s += "   !! It changed what the machine trusts (software sources, certificates, admin rights or accounts).\n";
     }
+    let own: Vec<&str> = findings.iter().filter(|f| f.why.contains(", read by its own tool: ")).map(|f| f.path.as_str()).collect();
+    if !own.is_empty() {
+        s += &format!("   It read {} of its own settings ({}): normal, nothing else touched {}.\n", if own.len() > 1 { "some" } else { "one" }, own.join(", "), if own.len() > 1 { "them" } else { "it" });
+    }
     if findings.iter().any(|f| ["/var/lib/dpkg/", "/var/lib/rpm/", "/usr/lib/sysimage/rpm/"].iter().any(|p| f.path.starts_with(p))) {
         s += "   It installed software with the system's package manager (normal for an installer).\n";
     }
@@ -314,13 +318,36 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
 }
 
 /// Names the programs behind each finding: "~/x" is /root/x inside the sandbox, system paths are themselves.
+/// Also clears a bait read only by its own tools (npm reading ~/.npmrc): it becomes an ordinary line that says so.
+/// The kernel tracer is what makes this possible; without it, every bait read stays an alarm.
 pub fn attribute(findings: &mut [Finding], a: &Activity) {
-    for f in findings {
+    for f in findings.iter_mut() {
         let inside = match f.path.strip_prefix('~') {
             Some(rest) => format!("/root{rest}"),
             None => f.path.clone(),
         };
         f.by = a.openers(&inside).0;
+        let Some(rel) = f.path.strip_prefix("~/") else { continue };
+        if f.kind != Kind::Secret || f.why.starts_with("looked inside") {
+            continue;
+        }
+        let tools = crate::canary::own_tools(rel);
+        let readers = a.opener_commands(&inside);
+        let own = |cmd: &Option<Vec<String>>| {
+            cmd.as_ref().and_then(|c| {
+                // the program itself, or the script handed to an interpreter (python3 /usr/local/bin/pip)
+                c.iter().take(3).filter_map(|x| x.rsplit('/').next()).find(|n| tools.contains(n)).map(str::to_string)
+            })
+        };
+        if tools.is_empty() || readers.is_empty() || !readers.iter().all(|r| own(r).is_some()) {
+            continue;
+        }
+        let mut names: Vec<String> = readers.iter().filter_map(own).collect();
+        names.sort();
+        names.dedup();
+        f.kind = Kind::Other;
+        f.why = format!("{}, read by its own tool: {}", f.why, names.join(", "));
+        f.group = "";
     }
 }
 
@@ -622,5 +649,31 @@ mod tests {
         let f = findings(&[], &Touches::default(), &sys);
         let alarms: usize = f.iter().filter(|f| f.kind == Kind::Trust && f.path.starts_with("/etc/ssl/certs/")).map(|f| f.count).sum();
         assert_eq!(alarms, 18, "every certificate is an alarm again: {f:?}");
+    }
+
+    #[test]
+    fn a_tool_reading_its_own_settings_is_not_a_theft_but_anything_else_is() {
+        use serde_json::json;
+        let canaries = vec![Canary { path: ".npmrc".into(), what: "npm publish token", group: crate::canary::DEV }];
+        let home = touches(&[(".npmrc", &[Op::Open, Op::Read])]);
+        let run = |events: Vec<serde_json::Value>| {
+            let a = Activity::from_events(&events, false);
+            let mut f = findings(&canaries, &home, &FsDiff::default());
+            attribute(&mut f, &a);
+            f
+        };
+        let npm = json!({"kind":"exec","t":1,"pid":10,"ppid":1,"comm":"node","file":"/usr/local/bin/node","args":["node","/usr/local/bin/npm","install"]});
+        let read = |pid| json!({"kind":"open","t":5,"pid":pid,"comm":"node","path":"/root/.npmrc","mode":"read","create":false});
+        let f = run(vec![npm.clone(), read(10)]);
+        assert_eq!(f[0].kind, Kind::Other, "{f:?}");
+        assert_eq!(f[0].why, "npm publish token, read by its own tool: npm");
+        assert!(in_short(&f, None).contains("It read one of its own settings (~/.npmrc)"));
+        // the classic attack: an install script, not npm, reads the token
+        let postinstall = json!({"kind":"exec","t":2,"pid":11,"ppid":10,"comm":"node","file":"/usr/local/bin/node","args":["node","install.js"]});
+        let f = run(vec![npm.clone(), postinstall, read(10), read(11)]);
+        assert_eq!(f[0].kind, Kind::Secret, "{f:?}");
+        // a program merely named after nothing it owns, or an unknown process: still an alarm
+        let f = run(vec![read(99)]);
+        assert_eq!(f[0].kind, Kind::Secret);
     }
 }

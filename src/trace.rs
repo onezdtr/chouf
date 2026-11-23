@@ -250,6 +250,20 @@ impl Activity {
         (who, wrote)
     }
 
+    /// The command line (file first, then argv) a pid was running at time t; a subshell answers as its script.
+    fn command_at(&self, pid: u32, t: i64) -> Option<Vec<String>> {
+        let p = self.procs.get(&pid)?;
+        match p.execs.iter().rev().find(|x| x.t <= t).or(p.execs.first()) {
+            Some(x) => Some(std::iter::once(x.file.clone()).chain(x.args.iter().cloned()).collect()),
+            None => self.command_at(self.shown_parent(pid)?, t),
+        }
+    }
+
+    /// The command lines of every process that opened a path (an unknown process gives None).
+    pub fn opener_commands(&self, container_path: &str) -> Vec<Option<Vec<String>>> {
+        self.opens.iter().filter(|o| o.path == container_path).map(|o| self.command_at(o.pid, o.t)).collect()
+    }
+
     /// The process tree, depth first, as (depth, command line, exit code).
     pub fn tree(&self) -> Vec<(usize, String, Option<i64>)> {
         // only processes that ran a program are shown; forked subshells pass their children up

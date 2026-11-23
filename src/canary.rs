@@ -21,6 +21,33 @@ pub const DEV: &str = "developer and cloud keys";
 pub const CHAT: &str = "messaging accounts";
 pub const PRIVATE: &str = "private keys and history";
 
+/// The programs that read a bait as part of their normal job (npm reads ~/.npmrc, git ~/.git-credentials, ssh the
+/// SSH keys). Matched on the name of the program run or of the script given to an interpreter (`python3 pip`).
+/// A bait read only by its own tools is not a theft; read by anything else, it still is. Browsers, wallets and chat
+/// sessions have no installer as their own tool: none listed.
+pub fn own_tools(rel: &str) -> &'static [&'static str] {
+    const TABLE: &[(&str, &[&str])] = &[
+        (".npmrc", &["npm", "npx", "pnpm", "yarn", "corepack"]),
+        (".netrc", &["pip", "pip3", "curl", "wget", "git", "git-remote-http", "git-remote-https", "ftp", "uv"]),
+        (".pypirc", &["twine", "poetry", "flit", "hatch"]),
+        (".git-credentials", &["git", "git-credential-store", "git-remote-http", "git-remote-https"]),
+        (".docker/config.json", &["docker", "podman", "buildah", "skopeo", "docker-credential-desktop"]),
+        (".kube/config", &["kubectl", "helm", "k9s", "kubectx", "minikube", "kind"]),
+        (".config/gh/hosts.yml", &["gh"]),
+        (".aws/credentials", &["aws", "aws_completer"]),
+        (".cargo/credentials.toml", &["cargo"]),
+        (".config/gcloud/", &["gcloud", "gsutil", "bq"]),
+        (".azure/", &["az"]),
+        (".vault-token", &["vault"]),
+        (".terraform.d/", &["terraform", "tofu"]),
+        (".pgpass", &["psql", "pg_dump", "pg_restore", "pg_dumpall"]),
+        (".config/rclone/", &["rclone"]),
+        (".ssh/id_", &["ssh", "scp", "sftp", "ssh-add", "ssh-keygen", "git", "rsync"]),
+        (".gnupg/", &["gpg", "gpg2", "gpg-agent", "gpgsm"]),
+    ];
+    TABLE.iter().find(|(p, _)| rel.starts_with(p)).map(|(_, t)| *t).unwrap_or(&[])
+}
+
 /// A fresh random token (16 hex chars).
 pub fn token() -> io::Result<String> {
     let mut b = [0u8; 8];
