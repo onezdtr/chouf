@@ -327,7 +327,10 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
 /// Names the programs behind each finding: "~/x" is /root/x inside the sandbox, system paths are themselves.
 /// Also clears a bait read only by its own tools (npm reading ~/.npmrc): it becomes an ordinary line that says so.
 /// The kernel tracer is what makes this possible; without it, every bait read stays an alarm.
-pub fn attribute(findings: &mut [Finding], a: &Activity) {
+/// `sys` is what the run changed on the system: a reader whose program file was added or changed during the run (a
+/// fake `npm` dropped by the program under test) is never excused, nor one named without a path.
+pub fn attribute(findings: &mut [Finding], a: &Activity, sys: &FsDiff) {
+    let planted = |path: &str| sys.added.iter().chain(&sys.changed).any(|p| p == path);
     for f in findings.iter_mut() {
         let inside = match f.path.strip_prefix('~') {
             Some(rest) => format!("/root{rest}"),
@@ -342,8 +345,17 @@ pub fn attribute(findings: &mut [Finding], a: &Activity) {
         let readers = a.opener_commands(&inside);
         let own = |cmd: &Option<Vec<String>>| {
             cmd.as_ref().and_then(|c| {
-                // the program itself, or the script handed to an interpreter (python3 /usr/local/bin/pip)
-                c.iter().take(3).filter_map(|x| x.rsplit('/').next()).find(|n| tools.contains(n)).map(str::to_string)
+                // c = [file run, argv...]: the program itself, or the script handed to an interpreter
+                // (python3 /usr/local/bin/pip). It must be a file that was there before the run, as was the interpreter.
+                if planted(&c[0]) {
+                    return None;
+                }
+                c.iter()
+                    .take(3)
+                    .filter(|x| x.starts_with('/') && !planted(x))
+                    .filter_map(|x| x.rsplit('/').next())
+                    .find(|n| tools.contains(n))
+                    .map(str::to_string)
             })
         };
         if tools.is_empty() || readers.is_empty() || !readers.iter().all(|r| own(r).is_some()) {
@@ -672,12 +684,13 @@ mod tests {
         use serde_json::json;
         let canaries = vec![Canary { path: ".npmrc".into(), what: "npm publish token", group: crate::canary::DEV }];
         let home = touches(&[(".npmrc", &[Op::Open, Op::Read])]);
-        let run = |events: Vec<serde_json::Value>| {
+        let run_with = |events: Vec<serde_json::Value>, sys: &FsDiff| {
             let a = Activity::from_events(&events, false);
-            let mut f = findings(&canaries, &home, &FsDiff::default());
-            attribute(&mut f, &a);
+            let mut f = findings(&canaries, &home, sys);
+            attribute(&mut f, &a, sys);
             f
         };
+        let run = |events: Vec<serde_json::Value>| run_with(events, &FsDiff::default());
         let npm = json!({"kind":"exec","t":1,"pid":10,"ppid":1,"comm":"node","file":"/usr/local/bin/node","args":["node","/usr/local/bin/npm","install"]});
         let read = |pid| json!({"kind":"open","t":5,"pid":pid,"comm":"node","path":"/root/.npmrc","mode":"read","create":false});
         let f = run(vec![npm.clone(), read(10)]);
@@ -691,5 +704,14 @@ mod tests {
         // a program merely named after nothing it owns, or an unknown process: still an alarm
         let f = run(vec![read(99)]);
         assert_eq!(f[0].kind, Kind::Secret);
+        // a fake npm the program dropped (or swapped in) during the run is not npm
+        let fake = FsDiff { added: vec!["/usr/local/bin/npm".into()], changed: vec![], deleted: vec![] };
+        let f = run_with(vec![npm.clone(), read(10)], &fake);
+        assert!(f.iter().any(|f| f.path == "~/.npmrc" && f.kind == Kind::Secret), "{f:?}");
+        // the real node running a fake npm script the program dropped: not excused
+        let spoof = json!({"kind":"exec","t":1,"pid":12,"ppid":1,"comm":"node","file":"/usr/local/bin/node","args":["node","/tmp/evil/npm","ci"]});
+        let dropped = FsDiff { added: vec!["/tmp/evil/npm".into()], changed: vec![], deleted: vec![] };
+        let f = run_with(vec![spoof, read(12)], &dropped);
+        assert!(f.iter().any(|f| f.path == "~/.npmrc" && f.kind == Kind::Secret), "{f:?}");
     }
 }

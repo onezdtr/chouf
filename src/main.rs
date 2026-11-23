@@ -201,7 +201,7 @@ fn run(o: Opts) -> io::Result<ExitCode> {
 
     let mut findings = report::findings(&s.canaries, &touches, &outcome.fs);
     if let Ok(a) = &activity {
-        report::attribute(&mut findings, a);
+        report::attribute(&mut findings, a, &outcome.fs);
     }
     finish(
         &s,
@@ -314,7 +314,7 @@ fn explore(o: Opts) -> io::Result<ExitCode> {
     };
     let mut findings = report::findings(&s.canaries, &touches, &outcome.fs);
     if let Ok(a) = &activity {
-        report::attribute(&mut findings, a);
+        report::attribute(&mut findings, a, &outcome.fs);
     }
     let seen = explore::observed(activity.as_ref().ok(), &activity.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
     eprintln!("chouf: judging what it says against what it did ({name})");
