@@ -3,6 +3,7 @@
 use crate::canary::Canary;
 use crate::sandbox::{FsDiff, Outcome};
 use crate::explore::{describe_short, Done, Verdict};
+use crate::i18n::{t, tf};
 use crate::trace::{Activity, Leak};
 use crate::watch::{Op, Touches};
 use serde_json::{json, Value};
@@ -306,7 +307,13 @@ pub fn leaked<'c>(canaries: &'c [Canary], l: &Leak) -> Option<&'c Canary> {
 }
 
 fn kb(n: u64) -> String {
-    if n < 1024 { format!("{n} bytes") } else if n < 1 << 20 { format!("{:.1} KB", n as f64 / 1024.0) } else { format!("{:.1} MB", n as f64 / 1048576.0) }
+    if n < 1024 {
+        tf("{} bytes", &[&n.to_string()])
+    } else if n < 1 << 20 {
+        tf("{} KB", &[&format!("{:.1}", n as f64 / 1024.0)])
+    } else {
+        tf("{} MB", &[&format!("{:.1}", n as f64 / 1048576.0)])
+    }
 }
 
 pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[Canary]) -> String {
@@ -316,44 +323,48 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
     let mut groups: Vec<&str> = secrets.iter().map(|f| f.group).filter(|g| !g.is_empty()).collect();
     groups.sort();
     groups.dedup();
-    let mut s = String::from("\nIn short\n");
+    let mut s = format!("\n{}\n", t("In short"));
     let probed = activity.is_some_and(|a| !a.blocked.is_empty());
     let leaks = activity.map(|a| a.leaks.as_slice()).unwrap_or(&[]);
     let mut proofs: Vec<(String, String)> = Vec::new();
     for l in leaks {
-        let what = leaked(canaries, l).map(|c| format!("your {}", c.what)).unwrap_or_else(|| "one of your secrets".into());
+        let what = leaked(canaries, l).map(|c| tf("your {}", &[&t(c.what)])).unwrap_or_else(|| t("one of your secrets"));
         let dest = l.name.clone().unwrap_or_else(|| l.ip.clone());
         if !proofs.contains(&(what.clone(), dest.clone())) {
             proofs.push((what, dest));
         }
     }
     for (what, dest) in proofs.iter().take(5) {
-        s += &format!("   !! PROOF: {what} left the machine, sent to {dest}.\n");
+        s += &format!("   !! {}\n", tf("PROOF: a secret left the machine, sent to {}: {}.", &[dest, what]));
     }
     if secrets.is_empty() && persist == 0 && trust == 0 && !probed && leaks.is_empty() {
-        s += "   Nothing alarming: no secret touched, nothing set to run again, nothing new trusted.\n";
+        s += &format!("   {}\n", t("Nothing alarming: no secret touched, nothing set to run again, nothing new trusted."));
     }
     if !secrets.is_empty() {
-        s += &format!("   !! It went through your {}: {} bait file{}.\n", groups.join(", "), secrets.len(), if secrets.len() > 1 { "s" } else { "" });
+        let fams: Vec<String> = groups.iter().map(|g| t(g)).collect();
+        let tpl = if secrets.len() > 1 { "It went through your {}: {} bait files." } else { "It went through your {}: {} bait file." };
+        s += &format!("   !! {}\n", tf(tpl, &[&fams.join(", "), &secrets.len().to_string()]));
     }
     if persist > 0 {
-        s += &format!("   !! It set itself up to run again on its own ({persist} way{}).\n", if persist > 1 { "s" } else { "" });
+        let tpl = if persist > 1 { "It set itself up to run again on its own ({} ways)." } else { "It set itself up to run again on its own ({} way)." };
+        s += &format!("   !! {}\n", tf(tpl, &[&persist.to_string()]));
     }
     if trust > 0 {
-        s += "   !! It changed what the machine trusts (software sources, certificates, admin rights or accounts).\n";
+        s += &format!("   !! {}\n", t("It changed what the machine trusts (software sources, certificates, admin rights or accounts)."));
     }
     let own: Vec<&str> = findings.iter().filter(|f| f.why.contains(", read by its own tool: ")).map(|f| f.path.as_str()).collect();
     if !own.is_empty() {
-        s += &format!("   It read {} of its own settings ({}): normal, nothing else touched {}.\n", if own.len() > 1 { "some" } else { "one" }, own.join(", "), if own.len() > 1 { "them" } else { "it" });
+        let tpl = if own.len() > 1 { "It read some of its own settings ({}): normal, nothing else touched them." } else { "It read one of its own settings ({}): normal, nothing else touched it." };
+        s += &format!("   {}\n", tf(tpl, &[&own.join(", ")]));
     }
     if findings.iter().any(|f| ["/var/lib/dpkg/", "/var/lib/rpm/", "/usr/lib/sysimage/rpm/"].iter().any(|p| f.path.starts_with(p))) {
-        s += "   It installed software with the system's package manager (normal for an installer).\n";
+        s += &format!("   {}\n", t("It installed software with the system's package manager (normal for an installer)."));
     }
     if let Some(a) = activity.filter(|a| !a.blocked.is_empty()) {
         let mut tries: Vec<String> = a.blocked.iter().map(|b| format!("{}:{}", b.ip, b.port)).collect();
         tries.dedup();
-        s += &format!("   !! It tried to reach your local network {} time{} (router, other machines): chouf refused. {}\n",
-            a.blocked.len(), if a.blocked.len() > 1 { "s" } else { "" }, tries.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+        let tpl = if a.blocked.len() > 1 { "It tried to reach your local network {} times (router, other machines): chouf refused. {}" } else { "It tried to reach your local network {} time (router, other machines): chouf refused. {}" };
+        s += &format!("   !! {}\n", tf(tpl, &[&a.blocked.len().to_string(), &tries.iter().take(4).cloned().collect::<Vec<_>>().join(", ")]));
     }
     // read secrets, then sent data out: the content may be encrypted (HTTPS), the sequence still says something
     if let (Some(a), false, true) = (activity, leaks.is_empty() == false, !secrets.is_empty()) {
@@ -366,8 +377,8 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
             }
         }
         if !out.is_empty() {
-            let list: Vec<String> = out.iter().take(3).map(|(d, n)| format!("{} to {d}", kb(*n))).collect();
-            s += &format!("   !! After reading your secrets it sent {}.\n", list.join(", "));
+            let list: Vec<String> = out.iter().take(3).map(|(d, n)| tf("{} to {}", &[&kb(*n), d])).collect();
+            s += &format!("   !! {}\n", tf("After reading your secrets it sent {}.", &[&list.join(", ")]));
         }
     }
     if let Some(a) = activity {
@@ -375,18 +386,21 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[C
         places.sort();
         places.dedup();
         match places.len() {
-            0 => s += "   It contacted nothing on the network.\n",
-            n => s += &format!("   It contacted {n} place{} on the network: {}.\n", if n > 1 { "s" } else { "" }, places.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
+            0 => s += &format!("   {}\n", t("It contacted nothing on the network.")),
+            n => {
+                let tpl = if n > 1 { "It contacted {} places on the network: {}." } else { "It contacted {} place on the network: {}." };
+                s += &format!("   {}\n", tf(tpl, &[&n.to_string(), &places.iter().take(5).cloned().collect::<Vec<_>>().join(", ")]));
+            }
         }
     }
     if !groups.is_empty() || persist > 0 {
-        s += "   If you already ran it on your own machine:\n";
+        s += &format!("   {}\n", t("If you already ran it on your own machine:"));
         for g in &groups {
-            s += &format!("     - {}\n", advice(g));
+            s += &format!("     - {}\n", t(advice(g)));
         }
         if persist > 0 {
             let where_: Vec<&str> = findings.iter().filter(|f| f.kind == Kind::Persistence).map(|f| f.path.as_str()).take(6).collect();
-            s += &format!("     - remove what it set up to come back: {}\n", where_.join(", "));
+            s += &format!("     - {}\n", tf("remove what it set up to come back: {}", &[&where_.join(", ")]));
         }
     }
     s
@@ -521,7 +535,7 @@ impl Report<'_> {
         );
         s += &in_short(&self.findings, self.activity.as_ref().ok().copied(), self.canaries);
         if let Some(x) = &self.exploration {
-            s += "\nHow chouf explored it\n";
+            s += &format!("\n{}\n", t("How chouf explored it"));
             for (i, d) in x.steps.iter().enumerate() {
                 s += &format!("   [{}] {}\n", i + 1, describe_short(d));
             }
@@ -530,20 +544,20 @@ impl Report<'_> {
             }
         }
         if !self.triggered.is_empty() {
-            s += "\nWhat it set up, set off once by chouf\n";
+            s += &format!("\n{}\n", t("What it set up, set off once by chouf"));
             for d in self.triggered {
                 s += &format!("   {}\n", describe_short(d));
             }
         }
         if self.findings.is_empty() {
-            s += "\nNothing: no bait touched, no file changed.\n";
+            s += &format!("\n{}\n", t("Nothing: no bait touched, no file changed."));
         }
         let mut last = None;
         let others = self.findings.iter().filter(|f| f.kind == Kind::Other).count();
         let mut shown_others = 0;
         for f in &self.findings {
             if last != Some(f.kind) {
-                s += &format!("\n{}\n", f.kind.title());
+                s += &format!("\n{}\n", t(f.kind.title()));
                 last = Some(f.kind);
             }
             // ordinary changes: a short sample in the terminal, all of them in report.json and report.html
@@ -551,7 +565,7 @@ impl Report<'_> {
                 shown_others += 1;
                 if shown_others > OTHER_LINES {
                     if shown_others == OTHER_LINES + 1 {
-                        s += &format!("   and {} more (report.html has them all)\n", others - OTHER_LINES);
+                        s += &format!("   {}\n", tf("and {} more (report.html has them all)", &[&(others - OTHER_LINES).to_string()]));
                     }
                     continue;
                 }
@@ -560,47 +574,48 @@ impl Report<'_> {
             let why = if f.why.is_empty() {
                 String::new()
             } else {
-                format!("  ({})", f.why)
+                format!("  ({})", crate::i18n::why(&f.why))
             };
-            let path = if f.count > 1 { format!("{} files in {}", f.count, f.path) } else { f.path.clone() };
-            s += &format!(" {mark} {:<9} {}{}\n", f.did.join(", "), path, why);
+            let path = if f.count > 1 { tf("{} files in {}", &[&f.count.to_string(), &f.path]) } else { f.path.clone() };
+            let did: Vec<String> = f.did.iter().map(|d| t(d)).collect();
+            s += &format!(" {mark} {:<9} {}{}\n", did.join(", "), path, why);
             // who did it matters for an alarm; for an ordinary change it is noise
             let by: &[String] = if f.kind == Kind::Other { &[] } else { &f.by };
             for b in by.iter().take(3) {
-                s += &format!("   {:<9} by {b}\n", "");
+                s += &format!("   {:<9} {} {b}\n", "", t("by"));
             }
             if by.len() > 3 {
-                s += &format!("   {:<9} and {} more\n", "", by.len() - 3);
+                s += &format!("   {:<9} {}\n", "", tf("and {} more", &[&(by.len() - 3).to_string()]));
             }
         }
         match &self.activity {
             Ok(a) => {
                 if !a.blocked.is_empty() {
-                    s += "\nWhat chouf refused on your local network\n";
+                    s += &format!("\n{}\n", t("What chouf refused on your local network"));
                     for b in a.blocked.iter().take(20) {
-                        s += &format!(" ! {}:{} {}  by {}\n", b.ip, b.port, b.proto, a.who(b.pid, i64::MAX));
+                        s += &format!(" ! {}:{} {}  {} {}\n", b.ip, b.port, b.proto, t("by"), a.who(b.pid, i64::MAX));
                     }
                     if a.blocked.len() > 20 {
                         s += &format!("   and {} more\n", a.blocked.len() - 20);
                     }
                 }
                 if !a.leaks.is_empty() {
-                    s += "\nWhat left the machine (bait data seen in what it sent)\n";
+                    s += &format!("\n{}\n", t("What left the machine (bait data seen in what it sent)"));
                     for l in a.leaks.iter().take(10) {
-                        let what = leaked(self.canaries, l).map(|c| c.what.to_string()).unwrap_or_else(|| "bait data".into());
+                        let what = leaked(self.canaries, l).map(|c| t(c.what)).unwrap_or_else(|| t("one of your secrets"));
                         let dest = l.name.clone().unwrap_or_else(|| l.ip.clone());
-                        s += &format!(" ! {what} → {dest} port {}  by {}\n      \"{}\"\n", l.port, a.who(l.pid, i64::MAX), l.excerpt);
+                        s += &format!(" ! {what} → {dest} port {}  {} {}\n      \"{}\"\n", l.port, t("by"), a.who(l.pid, i64::MAX), l.excerpt);
                     }
                 }
                 if !a.conns.is_empty() {
-                    s += "\nWhere it connected\n";
+                    s += &format!("\n{}\n", t("Where it connected"));
                     for c in a.conns.iter().take(30) {
                         let dest = match &c.name {
                             Some(n) => format!("{n} ({})", c.ip),
                             None => c.ip.clone(),
                         };
-                        let bytes = if c.sent + c.received > 0 { format!(" · sent {}, received {}", kb(c.sent), kb(c.received)) } else { String::new() };
-                        s += &format!("   {dest} port {} {}{bytes}  by {}\n", c.port, c.proto, a.who(c.pid, i64::MAX));
+                        let bytes = if c.sent + c.received > 0 { format!(" · {}", tf("sent {}, received {}", &[&kb(c.sent), &kb(c.received)])) } else { String::new() };
+                        s += &format!("   {dest} port {} {}{bytes}  {} {}\n", c.port, c.proto, t("by"), a.who(c.pid, i64::MAX));
                     }
                     if a.conns.len() > 30 {
                         s += &format!("   and {} more\n", a.conns.len() - 30);
@@ -608,7 +623,7 @@ impl Report<'_> {
                 }
                 let tree = a.tree();
                 if !tree.is_empty() {
-                    s += &format!("\nPrograms it ran ({})\n", tree.len());
+                    s += &format!("\n{} ({})\n", t("Programs it ran"), tree.len());
                     for (depth, cmd, exit) in tree.iter().take(40) {
                         let code = match exit {
                             Some(0) | None => String::new(),
@@ -617,23 +632,23 @@ impl Report<'_> {
                         s += &format!("   {}{cmd}{code}\n", "  ".repeat((*depth).min(8)));
                     }
                     if tree.len() > 40 {
-                        s += &format!("   and {} more (report.json has them all)\n", tree.len() - 40);
+                        s += &format!("   {}\n", tf("and {} more (report.json has them all)", &[&(tree.len() - 40).to_string()]));
                     }
                 }
                 if a.lost {
-                    s += "\nWarning: the kernel tracer lost events, the lists above may be incomplete.\n";
+                    s += &format!("\n{}\n", t("Warning: the kernel tracer lost events, the lists above may be incomplete."));
                 }
             }
             Err(why) => s += &format!("\n({why})\n"),
         }
         if let Some(x) = &self.exploration {
-            s += &format!("\nWhat it says vs what it does  (opinion of {}, not a measurement)\n", x.model);
+            s += &format!("\n{}  {}\n", t("What it says vs what it does"), tf("(opinion of {}, not a measurement)", &[&x.model]));
             match &x.verdict {
                 Ok(v) => {
                     let mark = match v.level.as_str() {
-                        "consistent" => "consistent: it does what it says",
-                        "suspicious" => "SUSPICIOUS: it does things it does not explain",
-                        _ => "MALICIOUS: it steals, hides or contradicts itself",
+                        "consistent" => t("consistent: it does what it says"),
+                        "suspicious" => t("SUSPICIOUS: it does things it does not explain"),
+                        _ => t("MALICIOUS: it steals, hides or contradicts itself"),
                     };
                     s += &format!("   {mark}\n   {}\n", v.summary);
                     for p in &v.points {
@@ -642,20 +657,17 @@ impl Report<'_> {
                             "contradicts" => "!!",
                             _ => " ?",
                         };
-                        s += &format!("   {sign} says: {}\n      does: {}\n", p.says, p.does);
+                        s += &format!("   {sign} {} {}\n      {} {}\n", t("says:"), p.says, t("does:"), p.does);
                     }
                 }
                 Err(e) => s += &format!("   ({e})\n"),
             }
         }
         if self.transient > 0 {
-            s += &format!(
-                "\n({} temporary files or folders created and removed in ~)\n",
-                self.transient
-            );
+            s += &format!("\n{}\n", tf("({} temporary files or folders created and removed in ~)", &[&self.transient.to_string()]));
         }
         if self.incomplete {
-            s += "\nWarning: some file events were lost, this list may be incomplete.\n";
+            s += &format!("\n{}\n", t("Warning: some file events were lost, this list may be incomplete."));
         }
         s
     }

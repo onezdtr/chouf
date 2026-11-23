@@ -208,13 +208,14 @@ What chouf ran, and what the program printed:\n{}\n\n\
 Measured findings (kind, what, where, why it matters, by which program):\n{}\n\n\
 Measured activity:\n{}\n\
 Answer with JSON. level: consistent (does what it says, nothing more), suspicious (does things it does not explain) or \
-malicious (steals, hides, or contradicts itself). summary: 2 or 3 plain sentences for a non-expert. points: each claim \
+malicious (steals, hides, or contradicts itself). summary: 2 or 3 plain sentences for a non-expert. Write summary, says and does in {lang}. points: each claim \
 next to what was observed, assessed as consistent, unexplained or contradicts; at most 8, the most important first.",
         cmd.join(" "),
         claim.unwrap_or("(not said)"),
         history.join("\n\n"),
         if facts.is_empty() { "none".to_string() } else { facts.join("\n") },
-        seen
+        seen,
+        lang = if crate::i18n::french() { "French" } else { "English" }
     )
 }
 

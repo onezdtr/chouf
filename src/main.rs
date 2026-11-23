@@ -1,6 +1,7 @@
 mod canary;
 mod explore;
 mod html;
+mod i18n;
 mod llm;
 mod persist;
 mod report;
@@ -29,6 +30,7 @@ usage: chouf run     [OPTIONS] -- COMMAND [ARGS]...
   --image IMAGE   container image (default ubuntu:24.04)
   --timeout SECS  stop a command after SECS seconds (default 300)
   --no-net        no network at all
+  --lang LANG     report language: en or fr (default: the system's)
   --allow-lan     let it reach your local network (by default chouf-trace refuses it: router, other machines)
   --file PATH     make PATH available read-only as /input/<name> (repeatable)
   --claim TEXT    explore: what the program is supposed to do (\"installs a GTK theme\")
@@ -47,6 +49,7 @@ struct Opts {
     claim: Option<String>,
     steps: usize,
     allow_lan: bool,
+    lang: Option<String>,
 }
 
 fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
@@ -59,6 +62,7 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
         claim: None,
         steps: explore::MAX_STEPS,
         allow_lan: false,
+        lang: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -68,6 +72,7 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
             "--timeout" => o.timeout = Duration::from_secs(value("--timeout")?.parse().map_err(|_| "--timeout: seconds")?),
             "--no-net" => o.net = false,
             "--allow-lan" => o.allow_lan = true,
+            "--lang" => o.lang = Some(value("--lang")?),
             "--file" => o.files.push(PathBuf::from(value("--file")?)),
             "--claim" if explore => o.claim = Some(value("--claim")?),
             "--steps" if explore => o.steps = value("--steps")?.parse().map_err(|_| "--steps: a number")?,
@@ -412,10 +417,13 @@ fn main() -> ExitCode {
         }
     };
     match parse(&args[1..], explore_mode) {
-        Ok(o) => cmd(o).unwrap_or_else(|e| {
+        Ok(o) => {
+            i18n::init(o.lang.as_deref());
+            cmd(o).unwrap_or_else(|e| {
             eprintln!("chouf: {e}");
             ExitCode::from(2)
-        }),
+            })
+        }
         Err(e) => {
             eprintln!("chouf: {e}\n\n{USAGE}");
             ExitCode::from(2)

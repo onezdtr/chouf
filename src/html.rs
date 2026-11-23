@@ -2,6 +2,7 @@
 //! Everything in it that came from the program, the sandbox or the model is escaped: a hostile program cannot
 //! write into the page.
 
+use crate::i18n::{t, tf};
 use serde_json::Value;
 
 fn esc(s: &str) -> String {
@@ -34,8 +35,8 @@ pub fn page(r: &Value, in_short: &str) -> String {
     let mut h = String::new();
     let cmd: Vec<String> = r["command"].as_array().into_iter().flatten().filter_map(|a| a.as_str()).map(esc).collect();
     h += &format!(
-        "<header><h1>What <code>{}</code> really did</h1><p>chouf session {} · {} · {}</p></header>",
-        cmd.join(" "),
+        "<header><h1>{}</h1><p>chouf session {} · {} · {}</p></header>",
+        if crate::i18n::french() { format!("Ce que <code>{}</code> a vraiment fait", cmd.join(" ")) } else { format!("What <code>{}</code> really did", cmd.join(" ")) },
         text(&r["session"]),
         text(&r["image"]),
         match r["exit_code"].as_i64() {
@@ -45,13 +46,14 @@ pub fn page(r: &Value, in_short: &str) -> String {
         }
     );
     // the plain summary, line by line: "!!" lines are alarms
-    h += "<section class=\"short\"><h2>In short</h2>";
-    for line in in_short.lines().map(str::trim).filter(|l| !l.is_empty() && *l != "In short") {
+    h += &format!("<section class=\"short\"><h2>{}</h2>", t("In short"));
+    let calm = t("Nothing alarming: no secret touched, nothing set to run again, nothing new trusted.");
+    for line in in_short.lines().map(str::trim).filter(|l| !l.is_empty() && *l != t("In short")) {
         if let Some(rest) = line.strip_prefix("!! ") {
             h += &format!("<p class=\"bad\">{}</p>", esc(rest));
         } else if let Some(rest) = line.strip_prefix("- ") {
             h += &format!("<ul><li>{}</li></ul>", esc(rest));
-        } else if line.starts_with("Nothing alarming") {
+        } else if line == calm {
             h += &format!("<p class=\"ok\">{}</p>", esc(line));
         } else {
             h += &format!("<p>{}</p>", esc(line));
@@ -62,13 +64,14 @@ pub fn page(r: &Value, in_short: &str) -> String {
     if let Some(v) = r["exploration"]["verdict"].as_object() {
         let level = v.get("level").and_then(Value::as_str).unwrap_or("");
         let (class, words) = match level {
-            "consistent" => ("ok", "Consistent: it does what it says"),
-            "suspicious" => ("warn", "Suspicious: it does things it does not explain"),
-            "malicious" => ("bad", "Malicious: it steals, hides or contradicts itself"),
-            _ => ("note", "No verdict"),
+            "consistent" => ("ok", t("consistent: it does what it says")),
+            "suspicious" => ("warn", t("SUSPICIOUS: it does things it does not explain")),
+            "malicious" => ("bad", t("MALICIOUS: it steals, hides or contradicts itself")),
+            _ => ("note", "—".to_string()),
         };
         h += &format!(
-            "<section class=\"verdict\"><h2>What it says vs what it does</h2><p class=\"level {class}\">{words}</p><p>{}</p><ul>",
+            "<section class=\"verdict\"><h2>{}</h2><p class=\"level {class}\">{words}</p><p>{}</p><ul>",
+            t("What it says vs what it does"),
             esc(v.get("summary").and_then(Value::as_str).unwrap_or(""))
         );
         for p in v.get("points").and_then(Value::as_array).into_iter().flatten() {
@@ -77,9 +80,9 @@ pub fn page(r: &Value, in_short: &str) -> String {
                 Some("contradicts") => "<span class=\"bad\">contradicts</span>",
                 _ => "<span class=\"warn\">unexplained</span>",
             };
-            h += &format!("<li>{mark} · says: {} — does: {}</li>", text(&p["says"]), text(&p["does"]));
+            h += &format!("<li>{mark} · {} {} — {} {}</li>", t("says:"), text(&p["says"]), t("does:"), text(&p["does"]));
         }
-        h += &format!("</ul><p class=\"note\">Opinion of {}, not a measurement. The findings below are measured.</p></section>", text(&r["exploration"]["model"]));
+        h += &format!("</ul><p class=\"note\">{}</p></section>", tf("(opinion of {}, not a measurement)", &[&text(&r["exploration"]["model"])]));
     }
 
     for (kind, title) in [
@@ -92,19 +95,19 @@ pub fn page(r: &Value, in_short: &str) -> String {
         if list.is_empty() {
             continue;
         }
-        h += &format!("<section><h2>{title}</h2>");
+        h += &format!("<section><h2>{}</h2>", t(title));
         for f in list {
-            let did: Vec<String> = f["did"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).map(esc).collect();
-            let why = text(&f["why"]);
+            let did: Vec<String> = f["did"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).map(|d| esc(&t(d))).collect();
+            let why = esc(&crate::i18n::why(f["why"].as_str().unwrap_or("")));
             h += &format!(
                 "<div class=\"f\"><span class=\"{}\">{}</span> <span class=\"path mono\">{}</span>{}",
                 if kind == "other" { "note" } else { "bad" },
                 did.join(", "),
-                match f["count"].as_u64() { Some(n) if n > 1 => format!("{n} files in {}", text(&f["path"])), _ => text(&f["path"]) },
+                match f["count"].as_u64() { Some(n) if n > 1 => tf("{} files in {}", &[&n.to_string(), &text(&f["path"])]), _ => text(&f["path"]) },
                 if why.is_empty() { String::new() } else { format!(" <span class=\"note\">({why})</span>") }
             );
             for b in f["by"].as_array().into_iter().flatten().take(if kind == "other" { 0 } else { 3 }) {
-                h += &format!("<div class=\"by mono\">by {}</div>", text(b));
+                h += &format!("<div class=\"by mono\">{} {}</div>", t("by"), text(b));
             }
             h += "</div>";
         }
@@ -113,15 +116,15 @@ pub fn page(r: &Value, in_short: &str) -> String {
 
     let a = &r["activity"];
     if let Some(leaks) = a["leaks"].as_array().filter(|l| !l.is_empty()) {
-        h += "<section><h2>What left the machine</h2>";
+        h += &format!("<section><h2>{}</h2>", t("What left the machine"));
         for l in leaks.iter().take(20) {
             let dest = l["name"].as_str().map(esc).unwrap_or_else(|| text(&l["ip"]));
-            h += &format!("<div class=\"f\"><span class=\"bad\">bait data sent to {dest} (port {})</span><div class=\"by mono\">by {}</div><div class=\"by mono\">&ldquo;{}&rdquo;</div></div>", l["port"], text(&l["by"]), text(&l["excerpt"]));
+            h += &format!("<div class=\"f\"><span class=\"bad\">{} → {dest} (port {})</span><div class=\"by mono\">{} {}</div><div class=\"by mono\">&ldquo;{}&rdquo;</div></div>", t("one of your secrets"), l["port"], t("by"), text(&l["by"]), text(&l["excerpt"]));
         }
         h += "</section>";
     }
     if let Some(conns) = a["connections"].as_array().filter(|c| !c.is_empty()) {
-        h += "<section><h2>Where it connected</h2>";
+        h += &format!("<section><h2>{}</h2>", t("Where it connected"));
         for c in conns.iter().take(50) {
             let dest = match c["name"].as_str() {
                 Some(n) => format!("{} ({})", esc(n), text(&c["ip"])),
@@ -129,19 +132,19 @@ pub fn page(r: &Value, in_short: &str) -> String {
             };
             let sent = c["sent"].as_u64().unwrap_or(0);
             let bytes = if sent > 0 { format!(" · sent {sent} bytes") } else { String::new() };
-            h += &format!("<div class=\"f\"><span class=\"mono\">{dest} port {}{bytes}</span><div class=\"by mono\">by {}</div></div>", c["port"], text(&c["by"]));
+            h += &format!("<div class=\"f\"><span class=\"mono\">{dest} port {}{bytes}</span><div class=\"by mono\">{} {}</div></div>", c["port"], t("by"), text(&c["by"]));
         }
         h += "</section>";
     }
     if let Some(blocked) = a["blocked"].as_array().filter(|b| !b.is_empty()) {
-        h += "<section><h2>What chouf refused on your local network</h2>";
+        h += &format!("<section><h2>{}</h2>", t("What chouf refused on your local network"));
         for b in blocked.iter().take(50) {
-            h += &format!("<div class=\"f\"><span class=\"bad mono\">{}:{} {}</span><div class=\"by mono\">by {}</div></div>", text(&b["ip"]), b["port"], text(&b["proto"]), text(&b["by"]));
+            h += &format!("<div class=\"f\"><span class=\"bad mono\">{}:{} {}</span><div class=\"by mono\">{} {}</div></div>", text(&b["ip"]), b["port"], text(&b["proto"]), t("by"), text(&b["by"]));
         }
         h += "</section>";
     }
     if let Some(progs) = a["programs"].as_array().filter(|p| !p.is_empty()) {
-        h += &format!("<section class=\"tree\"><h2>Programs it ran ({})</h2>", progs.len());
+        h += &format!("<section class=\"tree\"><h2>{} ({})</h2>", t("Programs it ran"), progs.len());
         for p in progs.iter().take(200) {
             let depth = p["depth"].as_u64().unwrap_or(0).min(8) as usize;
             h += &format!("<div class=\"mono\">{}{}</div>", "&nbsp;&nbsp;".repeat(depth), text(&p["command"]));
@@ -152,9 +155,10 @@ pub fn page(r: &Value, in_short: &str) -> String {
         h += &format!("<p class=\"note\">{}</p>", esc(why));
     }
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+        "<!doctype html><html lang=\"{}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">\
 <title>chouf · {}</title><style>{STYLE}</style></head><body><main>{h}</main></body></html>",
+        if crate::i18n::french() { "fr" } else { "en" },
         cmd.join(" ")
     )
 }
@@ -174,6 +178,6 @@ mod tests {
         let p = page(&r, &format!("In short\n   !! {evil}\n"));
         assert!(!p.contains("<script>") && !p.contains("<img"), "unescaped program text");
         assert!(p.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(p.contains("Content-Security-Policy") && p.contains("Malicious"));
+        assert!(p.contains("Content-Security-Policy") && p.contains("MALICIOUS"));
     }
 }
