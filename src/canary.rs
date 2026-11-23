@@ -130,6 +130,12 @@ const PLAIN: &[(&str, &str)] = &[
     ("projects/shop/README.md", "# shop\n"),
 ];
 
+/// What chouf wrote at `rel` before the run, for the ordinary (non-bait) files: a file that no longer reads like
+/// this was changed by the program.
+pub fn planted(rel: &str) -> Option<&'static str> {
+    PLAIN.iter().find(|(p, _)| *p == rel).map(|(_, body)| *body)
+}
+
 /// Writes the fake home and returns the bait list.
 pub fn plant(home: &Path, token: &str) -> io::Result<Vec<Canary>> {
     let write = |rel: &str, body: &[u8], mode: u32| -> io::Result<()> {

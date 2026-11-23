@@ -11,6 +11,19 @@ use std::time::{Duration, Instant};
 
 pub const OUTPUT_LIMIT: usize = 1 << 20;
 
+/// What a desktop runs: decoy processes (sleep under other names, in a tmpfs that `podman diff` never shows) so a
+/// program that counts processes or looks for a desktop session finds one, and a pid 1 called systemd.
+const DECOYS: &str = "systemd-journald systemd-udevd dbus-daemon NetworkManager gdm gnome-shell Xwayland pipewire wireplumber pipewire-pulse gvfsd tracker-miner-fs-3 evolution-source-registry gnome-keyring-daemon firefox code cron sshd cupsd udisksd";
+
+/// The keep-alive script of a live sandbox (its pid 1).
+pub fn keepalive() -> Vec<String> {
+    let script = format!(
+        "d=/dev/shm/.session; mkdir -p $d; for n in systemd {DECOYS}; do ln -sf /bin/sleep $d/$n; done; \
+         for n in {DECOYS}; do $d/$n 2147483647 & done; exec $d/systemd 2147483647"
+    );
+    vec!["/bin/sh".into(), "-c".into(), script]
+}
+
 pub struct Spec<'a> {
     pub name: String,
     pub image: &'a str,
@@ -104,6 +117,18 @@ pub fn create<'a>(spec: &'a Spec<'a>) -> io::Result<Created<'a>> {
         "/root",
         "--env",
         "HOME=/root",
+        // what a terminal session has, and not the variable podman sets to say "you are in a container"
+        "--unsetenv=container",
+        "--env",
+        "USER=root",
+        "--env",
+        "LOGNAME=root",
+        "--env",
+        "SHELL=/bin/bash",
+        "--env",
+        "LANG=C.UTF-8",
+        "--env",
+        "TERM=xterm-256color",
     ];
     let input;
     if let Some(dir) = spec.input {
@@ -185,13 +210,18 @@ pub struct Live<'a> {
     spec: &'a Spec<'a>,
     _container: Container<'a>,
     started: Instant,
+    /// The sandbox's pid 1 as the host sees it: its process tree is chouf's (decoys), not the program's.
+    pub init_pid: u32,
 }
 
 impl<'a> Created<'a> {
     /// Starts the container's keep-alive process (the spec's cmd must be one, like `sleep infinity`).
     pub fn start_live(self) -> io::Result<Live<'a>> {
         podman(&["start", &self.spec.name])?;
-        Ok(Live { spec: self.spec, _container: self._container, started: Instant::now() })
+        let pid = podman(&["inspect", "--format", "{{.State.Pid}}", &self.spec.name])?;
+        let init_pid = String::from_utf8_lossy(&pid.stdout).trim().parse().unwrap_or(0);
+        thread::sleep(Duration::from_millis(300)); // let the decoys come up before the program looks around
+        Ok(Live { spec: self.spec, _container: self._container, started: Instant::now(), init_pid })
     }
 }
 
@@ -233,6 +263,22 @@ impl Live<'_> {
             stdout: out.join().unwrap_or_default(),
             stderr: err.join().unwrap_or_default(),
         })
+    }
+
+    /// What changed on the system so far, the machine still running.
+    pub fn diff_now(&self) -> io::Result<FsDiff> {
+        parse_diff(&podman(&["diff", "--format", "json", &self.spec.name])?.stdout)
+    }
+
+    /// A small file inside the machine (at most 64 KiB), or None.
+    pub fn read_file(&self, path: &str) -> Option<String> {
+        let out = Command::new("podman")
+            .args(["exec", &self.spec.name, "head", "-c", "65536", path])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// True while the machine still runs (a timed-out command stops it).

@@ -230,6 +230,39 @@ impl Activity {
         a
     }
 
+    /// Drops a process tree that is chouf's own (the sandbox's pid 1 and its decoys), with everything it did.
+    pub fn without_tree(mut self, root: u32) -> Activity {
+        if root == 0 {
+            return self;
+        }
+        let mut hidden: BTreeSet<u32> = BTreeSet::from([root]);
+        loop {
+            let more: Vec<u32> = self.procs.iter().filter(|(pid, p)| hidden.contains(&p.ppid) && !hidden.contains(pid)).map(|(pid, _)| *pid).collect();
+            if more.is_empty() {
+                break;
+            }
+            hidden.extend(more);
+        }
+        self.procs.retain(|pid, _| !hidden.contains(pid));
+        self.opens.retain(|o| !hidden.contains(&o.pid));
+        self.conns.retain(|c| !hidden.contains(&c.pid));
+        self.blocked.retain(|b| !hidden.contains(&b.pid));
+        self
+    }
+
+    /// Drops chouf's own reads of files inside the sandbox (sandbox::Live::read_file runs `head -c 65536 PATH`).
+    pub fn without_our_reads(mut self) -> Activity {
+        let ours: BTreeSet<u32> = self
+            .procs
+            .iter()
+            .filter(|(_, p)| p.execs.len() == 1 && p.execs[0].args.len() == 4 && p.execs[0].args[..3] == ["head", "-c", "65536"])
+            .map(|(pid, _)| *pid)
+            .collect();
+        self.procs.retain(|pid, _| !ours.contains(pid));
+        self.opens.retain(|o| !ours.contains(&o.pid));
+        self
+    }
+
     /// The closest ancestor that ran a program of its own (a forked subshell does not: it is its parent's code).
     fn shown_parent(&self, pid: u32) -> Option<u32> {
         let mut cur = self.procs.get(&pid)?.ppid;

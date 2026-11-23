@@ -325,6 +325,9 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
 }
 
 /// Names the programs behind each finding: "~/x" is /root/x inside the sandbox, system paths are themselves.
+/// The shells persist.rs starts (a new terminal, a login): what they run from a startup file is the program's doing.
+const CHOUF_SHELLS: &[&str] = &["bash -i -c true", "bash -l -c true"];
+
 /// Also clears a bait read only by its own tools (npm reading ~/.npmrc): it becomes an ordinary line that says so.
 /// The kernel tracer is what makes this possible; without it, every bait read stays an alarm.
 /// `sys` is what the run changed on the system: a reader whose program file was added or changed during the run (a
@@ -336,7 +339,8 @@ pub fn attribute(findings: &mut [Finding], a: &Activity, sys: &FsDiff) {
             Some(rest) => format!("/root{rest}"),
             None => f.path.clone(),
         };
-        f.by = a.openers(&inside).0;
+        // the shells chouf opens to set off a startup file read that file by design: they are not the program
+        f.by = a.openers(&inside).0.into_iter().filter(|w| !CHOUF_SHELLS.contains(&w.as_str())).collect();
         let Some(rel) = f.path.strip_prefix("~/") else { continue };
         if f.kind != Kind::Secret || f.why.starts_with("looked inside") {
             continue;
@@ -401,6 +405,8 @@ pub struct Report<'a> {
     /// What the kernel tracer saw, or why there is nothing.
     pub activity: Result<&'a Activity, String>,
     pub exploration: Option<Exploration<'a>>,
+    /// What the program set up to come back, set off once by chouf (persist.rs).
+    pub triggered: &'a [Done],
 }
 
 impl Report<'_> {
@@ -412,6 +418,7 @@ impl Report<'_> {
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
             "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count})).collect::<Vec<_>>(),
             "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
+            "triggered": self.triggered.iter().map(|d| json!({"did": describe_short(d), "exit": d.exit, "timed_out": d.timed_out})).collect::<Vec<_>>(),
             "exploration": self.exploration.as_ref().map(|x| json!({
                 "model": x.model, "note": x.note,
                 "steps": x.steps.iter().map(|d| json!({"did": describe_short(d), "exit": d.exit, "timed_out": d.timed_out})).collect::<Vec<_>>(),
@@ -451,6 +458,12 @@ impl Report<'_> {
             }
             if let Some(n) = &x.note {
                 s += &format!("   ({n})\n");
+            }
+        }
+        if !self.triggered.is_empty() {
+            s += "\nWhat it set up, set off once by chouf\n";
+            for d in self.triggered {
+                s += &format!("   {}\n", describe_short(d));
             }
         }
         if self.findings.is_empty() {

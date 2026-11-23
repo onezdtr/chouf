@@ -2,6 +2,7 @@ mod canary;
 mod explore;
 mod html;
 mod llm;
+mod persist;
 mod report;
 mod sandbox;
 mod trace;
@@ -176,35 +177,112 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
     Ok(if alarming { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
-fn run(o: Opts) -> io::Result<ExitCode> {
-    let s = prepare(&o)?;
-    let spec = sandbox::Spec {
+/// Home files a program changes to come back by itself: the startup files chouf planted (compared with what it
+/// wrote), and anything in the folders the desktop and systemd start from.
+fn home_ways_back(home: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for rel in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".ssh/rc"] {
+        if let Ok(now) = fs::read_to_string(home.join(rel)) {
+            if canary::planted(rel) != Some(now.as_str()) {
+                out.push(format!("~/{rel}"));
+            }
+        }
+    }
+    for dir in [".config/autostart", ".config/systemd/user"] {
+        for e in fs::read_dir(home.join(dir)).into_iter().flatten().flatten() {
+            out.push(format!("~/{dir}/{}", e.file_name().to_string_lossy()));
+        }
+    }
+    out
+}
+
+/// Sets off, once, what the program set up to come back (persist.rs), watched like the rest of the run.
+fn set_off(live: &sandbox::Live, s: &Session) -> io::Result<Vec<Done>> {
+    if !live.alive() {
+        return Ok(vec![]);
+    }
+    let sys = sandbox::interesting(live.diff_now()?, &s.noise);
+    let system: Vec<String> = sys.added.into_iter().chain(sys.changed).collect();
+    let read = |p: &str| live.read_file(p);
+    let mut done = Vec::new();
+    for t in persist::plan(&home_ways_back(&s.home), &system, &read) {
+        eprintln!("chouf: setting off what it set up: {}", t.why);
+        let st = live.exec(&t.argv, "", Duration::from_secs(persist::TRIGGER_SECONDS + 15))?;
+        done.push(Done {
+            action: Action::Run { argv: t.argv, stdin: String::new(), why: t.why },
+            exit: st.exit,
+            timed_out: st.timed_out,
+            stdout: String::from_utf8_lossy(&st.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&st.stderr).into_owned(),
+        });
+        if st.timed_out || !live.alive() {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// The sandbox every run uses: created, watched from its first instruction, then started as a desktop-looking machine
+/// that stays up while commands run in it.
+struct Machine<'a> {
+    live: sandbox::Live<'a>,
+    tracer: Result<trace::Tracer, String>,
+    watcher: watch::Watcher,
+}
+
+fn machine<'a>(o: &Opts, s: &Session, spec: &'a sandbox::Spec<'a>) -> io::Result<Machine<'a>> {
+    let created = sandbox::create(spec)?;
+    // before start: the container's cgroup exists from `podman init`, so the first instruction is seen
+    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
+    let watcher = watch::Watcher::start(&s.home)?;
+    let live = created.start_live()?;
+    Ok(Machine { live, tracer, watcher })
+}
+
+fn spec<'a>(o: &'a Opts, s: &'a Session, keepalive: &'a [String]) -> sandbox::Spec<'a> {
+    sandbox::Spec {
         name: format!("chouf-{}", s.id),
         image: &o.image,
         home: &s.home,
         input: s.input.as_deref(),
-        cmd: &o.cmd,
+        cmd: keepalive,
         timeout: o.timeout,
         net: o.net,
+    }
+}
+
+/// Stops the machine and writes the report.
+/// `judge` (explore): turns the measured findings into the exploration part of the report, verdict included.
+fn conclude<'e>(
+    o: &Opts,
+    s: &Session,
+    m: Machine,
+    first: Option<&Done>,
+    judge: Option<&dyn Fn(&[report::Finding], &str) -> report::Exploration<'e>>,
+    triggered: &[Done],
+) -> io::Result<ExitCode> {
+    let init = m.live.init_pid;
+    let (fs_diff, elapsed) = m.live.finish()?;
+    let touches = m.watcher.stop()?;
+    let activity = m.tracer.map(|t| t.stop().without_tree(init).without_our_reads());
+    let outcome = sandbox::Outcome {
+        exit: first.and_then(|d| d.exit),
+        timed_out: first.is_some_and(|d| d.timed_out),
+        stdout: first.map(|d| d.stdout.clone().into_bytes()).unwrap_or_default(),
+        stderr: first.map(|d| d.stderr.clone().into_bytes()).unwrap_or_default(),
+        elapsed,
+        fs: sandbox::interesting(fs_diff, &s.noise),
     };
-    let created = sandbox::create(&spec)?;
-    // before start: the container's cgroup exists from `podman init`, so the program's first instruction is seen
-    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
-    let watcher = watch::Watcher::start(&s.home)?;
-    let outcome = created.start();
-    let touches = watcher.stop()?;
-    let activity = tracer.map(trace::Tracer::stop);
-    let mut outcome = outcome?;
-    outcome.fs = sandbox::interesting(std::mem::take(&mut outcome.fs), &s.noise);
     fs::write(s.dir.join("stdout"), &outcome.stdout)?;
     fs::write(s.dir.join("stderr"), &outcome.stderr)?;
-
     let mut findings = report::findings(&s.canaries, &touches, &outcome.fs);
     if let Ok(a) = &activity {
         report::attribute(&mut findings, a, &outcome.fs);
     }
+    let seen = explore::observed(activity.as_ref().ok(), &activity.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
+    let exploration = judge.map(|j| j(&findings, &seen));
     finish(
-        &s,
+        s,
         &report::Report {
             id: &s.id,
             image: &o.image,
@@ -214,9 +292,31 @@ fn run(o: Opts) -> io::Result<ExitCode> {
             transient: report::transient_count(&touches),
             incomplete: touches.incomplete,
             activity: activity.as_ref().map_err(Clone::clone),
-            exploration: None,
+            exploration,
+            triggered,
         },
     )
+}
+
+fn run_step(live: &sandbox::Live, argv: &[String], stdin: &str, why: &str, timeout: Duration) -> io::Result<Done> {
+    let st = live.exec(argv, stdin, timeout)?;
+    Ok(Done {
+        action: Action::Run { argv: argv.to_vec(), stdin: stdin.to_string(), why: why.to_string() },
+        exit: st.exit,
+        timed_out: st.timed_out,
+        stdout: String::from_utf8_lossy(&st.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&st.stderr).into_owned(),
+    })
+}
+
+fn run(o: Opts) -> io::Result<ExitCode> {
+    let s = prepare(&o)?;
+    let keepalive = sandbox::keepalive();
+    let spec = spec(&o, &s, &keepalive);
+    let m = machine(&o, &s, &spec)?;
+    let first = run_step(&m.live, &o.cmd, "", "the command you asked to check", o.timeout)?;
+    let triggered = if first.timed_out { vec![] } else { set_off(&m.live, &s)? };
+    conclude(&o, &s, m, Some(&first), None, &triggered)
 }
 
 /// Bait files some process opened so far, as "~/.ssh/id_ed25519".
@@ -236,8 +336,8 @@ fn save_step(dir: &Path, n: usize, d: &Done) -> io::Result<()> {
 }
 
 fn explore(o: Opts) -> io::Result<ExitCode> {
-    let (model, name): (Box<dyn llm::Llm>, String) = if let Some(s) = llm::Scripted::from_env() {
-        (Box::new(s), "a scripted model (test)".into())
+    let (model, name): (Box<dyn llm::Llm>, String) = if let Some(sc) = llm::Scripted::from_env() {
+        (Box::new(sc), "a scripted model (test)".into())
     } else if let Some(g) = llm::Gemini::from_env() {
         let name = g.model().to_string();
         (Box::new(g), name)
@@ -245,46 +345,34 @@ fn explore(o: Opts) -> io::Result<ExitCode> {
         return Err(io::Error::other("explore needs a Gemini key: set GEMINI_API_KEY or write it to ~/.config/chouf/gemini"));
     };
     let s = prepare(&o)?;
-    let keepalive = ["sleep".to_string(), "infinity".to_string()];
-    let spec = sandbox::Spec {
-        name: format!("chouf-{}", s.id),
-        image: &o.image,
-        home: &s.home,
-        input: s.input.as_deref(),
-        cmd: &keepalive,
-        timeout: o.timeout,
-        net: o.net,
-    };
-    let created = sandbox::create(&spec)?;
-    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
-    let watcher = watch::Watcher::start(&s.home)?;
-    let live = created.start_live()?;
+    let keepalive = sandbox::keepalive();
+    let spec = spec(&o, &s, &keepalive);
+    let m = machine(&o, &s, &spec)?;
 
     let mut done: Vec<Done> = Vec::new();
     let mut action = Action::Run { argv: o.cmd.clone(), stdin: String::new(), why: "the command you asked to check".into() };
     let mut note = None;
     loop {
-        let (exit, timed_out, stdout, stderr) = match &action {
-            Action::Run { argv, stdin, .. } => {
+        let d = match &action {
+            Action::Run { argv, stdin, why } => {
                 eprintln!("chouf: [{}] $ {}", done.len() + 1, argv.join(" "));
-                let st = live.exec(argv, stdin, o.timeout)?;
-                (st.exit, st.timed_out, String::from_utf8_lossy(&st.stdout).into_owned(), String::from_utf8_lossy(&st.stderr).into_owned())
+                run_step(&m.live, argv, stdin, why, o.timeout)?
             }
             Action::Wait { .. } => {
                 let pause = explore::wait_duration(&action).unwrap();
                 eprintln!("chouf: [{}] waiting {} s", done.len() + 1, pause.as_secs());
                 thread::sleep(pause);
-                (None, false, String::new(), String::new())
+                Done { action: action.clone(), exit: None, timed_out: false, stdout: String::new(), stderr: String::new() }
             }
             Action::Stop { .. } => break,
         };
-        let d = Done { action: action.clone(), exit, timed_out, stdout, stderr };
         save_step(&s.dir, done.len() + 1, &d)?;
+        let stop = d.timed_out || !m.live.alive();
         done.push(d);
-        if timed_out || !live.alive() || done.len() > o.steps {
+        if stop || done.len() > o.steps {
             break;
         }
-        let a = tracer.as_ref().ok().map(trace::Tracer::snapshot);
+        let a = m.tracer.as_ref().ok().map(|t| t.snapshot().without_tree(m.live.init_pid));
         let seen = explore::observed(a.as_ref(), &a.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
         match explore::next(model.as_ref(), &o.cmd, o.claim.as_deref(), &done, &seen, o.steps + 1 - done.len()) {
             Ok(next) => {
@@ -299,42 +387,17 @@ fn explore(o: Opts) -> io::Result<ExitCode> {
             }
         }
     }
-
-    let (fs_diff, elapsed) = live.finish()?;
-    let touches = watcher.stop()?;
-    let activity = tracer.map(trace::Tracer::stop);
-    let first = done.first();
-    let outcome = sandbox::Outcome {
-        exit: first.and_then(|d| d.exit),
-        timed_out: done.iter().any(|d| d.timed_out),
-        stdout: first.map(|d| d.stdout.clone().into_bytes()).unwrap_or_default(),
-        stderr: first.map(|d| d.stderr.clone().into_bytes()).unwrap_or_default(),
-        elapsed,
-        fs: sandbox::interesting(fs_diff, &s.noise),
+    let triggered = if done.iter().any(|d| d.timed_out) { vec![] } else { set_off(&m.live, &s)? };
+    let first = done.first().cloned();
+    let all: Vec<Done> = done.iter().chain(&triggered).cloned().collect();
+    let judge = |findings: &[report::Finding], seen: &str| {
+        eprintln!("chouf: judging what it says against what it did ({name})");
+        let verdict = explore::judge(model.as_ref(), &o.cmd, o.claim.as_deref(), &all, findings, seen)
+            .map_err(|e| format!("no verdict: {e}"))
+            .and_then(|v| v.ok_or_else(|| "no verdict: the model's answer was unusable".to_string()));
+        report::Exploration { steps: &done, verdict, model: name.clone(), note: note.clone() }
     };
-    let mut findings = report::findings(&s.canaries, &touches, &outcome.fs);
-    if let Ok(a) = &activity {
-        report::attribute(&mut findings, a, &outcome.fs);
-    }
-    let seen = explore::observed(activity.as_ref().ok(), &activity.as_ref().map(|a| baits_opened(a, &s.canaries)).unwrap_or_default());
-    eprintln!("chouf: judging what it says against what it did ({name})");
-    let verdict = explore::judge(model.as_ref(), &o.cmd, o.claim.as_deref(), &done, &findings, &seen)
-        .map_err(|e| format!("no verdict: {e}"))
-        .and_then(|v| v.ok_or_else(|| "no verdict: the model's answer was unusable".to_string()));
-    finish(
-        &s,
-        &report::Report {
-            id: &s.id,
-            image: &o.image,
-            cmd: &o.cmd,
-            outcome: &outcome,
-            findings,
-            transient: report::transient_count(&touches),
-            incomplete: touches.incomplete,
-            activity: activity.as_ref().map_err(Clone::clone),
-            exploration: Some(report::Exploration { steps: &done, verdict, model: name, note }),
-        },
-    )
+    conclude(&o, &s, m, first.as_ref(), Some(&judge), &triggered)
 }
 
 fn main() -> ExitCode {
