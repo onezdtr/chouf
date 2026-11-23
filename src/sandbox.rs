@@ -32,7 +32,14 @@ pub struct Spec<'a> {
     pub cmd: &'a [String],
     pub timeout: Duration,
     pub net: bool,
+    /// Caps for the whole machine, as podman takes them ("2g", "1.5"); None: no cap.
+    pub memory: Option<&'a str>,
+    pub cpus: Option<&'a str>,
 }
+
+/// Processes the machine may hold at once: far more than any installer needs, few enough that a fork bomb in the
+/// program under test cannot freeze the computer running chouf.
+const PIDS_LIMIT: &str = "--pids-limit=4096";
 
 #[derive(Default)]
 pub struct Outcome {
@@ -129,7 +136,17 @@ pub fn create<'a>(spec: &'a Spec<'a>) -> io::Result<Created<'a>> {
         "LANG=C.UTF-8",
         "--env",
         "TERM=xterm-256color",
+        PIDS_LIMIT,
     ];
+    let (memory, cpus);
+    if let Some(m) = spec.memory {
+        memory = format!("--memory={m}");
+        args.push(&memory);
+    }
+    if let Some(c) = spec.cpus {
+        cpus = format!("--cpus={c}");
+        args.push(&cpus);
+    }
     let input;
     if let Some(dir) = spec.input {
         input = format!("{}:/input:ro,Z", dir.display());
@@ -372,6 +389,8 @@ pub fn noise(image: &str, cache: &Path) -> io::Result<BTreeSet<String>> {
         cmd: &cmd,
         timeout: Duration::from_secs(120),
         net: true,
+        memory: None,
+        cpus: None,
     };
     let out = run(&spec);
     let _ = fs::remove_dir_all(&home);

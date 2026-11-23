@@ -1,0 +1,3 @@
+# The machine install scripts run in: Ubuntu 24.04, plus what `curl … | bash` needs.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*

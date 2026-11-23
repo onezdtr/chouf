@@ -1,0 +1,14 @@
+[Unit]
+Description=chouf online: invite-only web front for chouf (127.0.0.1:4800)
+After=network-online.target
+
+[Service]
+# the code lives where its user cannot change it (/opt, root's); its data where there is room
+ExecStart=/usr/bin/python3 /opt/chouf-web/chouf_web.py
+Environment=CHOUF_WEB_DATA=%h/.local/share/chouf-web
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

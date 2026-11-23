@@ -33,6 +33,7 @@ usage: chouf run     [OPTIONS] -- COMMAND [ARGS]...
   --no-net        no network at all
   --lang LANG     report language: en or fr (default: the system's)
   --allow-lan     let it reach your local network (by default chouf-trace refuses it: router, other machines)
+  --memory SIZE   cap the sandbox's memory (\"2g\"); --cpus N  cap its processors (default: no cap)
   --file PATH     make PATH available read-only as /input/<name> (repeatable)
   --claim TEXT    explore: what the program is supposed to do (\"installs a GTK theme\")
   --steps N       explore: at most N steps after the first run (default 6)
@@ -51,6 +52,8 @@ struct Opts {
     steps: usize,
     allow_lan: bool,
     lang: Option<String>,
+    memory: Option<String>,
+    cpus: Option<String>,
 }
 
 fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
@@ -64,6 +67,8 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
         steps: explore::MAX_STEPS,
         allow_lan: false,
         lang: None,
+        memory: None,
+        cpus: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -74,6 +79,8 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
             "--no-net" => o.net = false,
             "--allow-lan" => o.allow_lan = true,
             "--lang" => o.lang = Some(value("--lang")?),
+            "--memory" => o.memory = Some(value("--memory")?).filter(|v| v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')).ok_or("--memory: like 2g")?.into(),
+            "--cpus" => o.cpus = Some(value("--cpus")?).filter(|v| v.parse::<f64>().is_ok_and(|n| n > 0.0)).ok_or("--cpus: a number, like 2")?.into(),
             "--file" => o.files.push(PathBuf::from(value("--file")?)),
             "--claim" if explore => o.claim = Some(value("--claim")?),
             "--steps" if explore => o.steps = value("--steps")?.parse().map_err(|_| "--steps: a number")?,
@@ -271,6 +278,8 @@ fn spec<'a>(o: &'a Opts, s: &'a Session, keepalive: &'a [String]) -> sandbox::Sp
         cmd: keepalive,
         timeout: o.timeout,
         net: o.net,
+        memory: o.memory.as_deref(),
+        cpus: o.cpus.as_deref(),
     }
 }
 
