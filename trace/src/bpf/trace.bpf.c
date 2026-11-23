@@ -495,7 +495,14 @@ static __always_inline int private6(const u32 *a) // network byte order words
 		struct lan6 *l = bpf_map_lookup_elem(&lan6_prefixes, &k);
 		if (!l || !l->used)
 			break;
-		if (__builtin_memcmp(l->prefix, a, 8) == 0)
+		// a plain loop, not memcmp: older clang leaves memcmp as a call, which a BPF program cannot make
+		const u8 *b = (const u8 *)a;
+		int same = 1;
+#pragma unroll
+		for (int j = 0; j < 8; j++)
+			if (l->prefix[j] != b[j])
+				same = 0;
+		if (same)
 			return 1;
 	}
 	return 0;
