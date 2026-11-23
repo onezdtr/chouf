@@ -121,6 +121,22 @@ Each run is kept in `~/.local/share/chouf/sessions/<id>/` (`report.json`, `stdou
 Early. Done: sandbox, baits, file watching, kernel tracer (who did what, where it connected), the explorer and its
 verdict. Next: a plain-language report for non-experts, more baits (browsers, password managers, crypto wallets).
 
+## Related work
+
+chouf puts together pieces that exist separately (checked November 2026):
+
+- **OpenSSF package-analysis**, **Packj**: run packages from registries in a sandbox and record files, network and
+  commands (strace, gVisor), for experts and pipelines. No bait secrets, no explorer, no plain verdict.
+- **sandbox-node**: npm/pnpm/yarn/bun installs in a Docker or Podman sandbox, with fake credentials. JavaScript
+  installs only, no kernel tracing, no model.
+- **Koru**: eBPF and honeytokens to catch AI agents touching credentials. No sandbox for an unknown program.
+- **Tracee, Falco, Tetragon, Inspektor Gadget, AgentSight**: eBPF observability for production or for AI agents.
+- **ANY.RUN, Joe Sandbox**: commercial malware sandboxes with AI summaries, for analysts.
+- **CHASE** (arXiv 2601.06838): LLM agents that judge PyPI packages; no code published.
+
+What chouf adds: any program or install script, a home full of realistic bait, the kernel's account of who did
+what, a model that drives the program like a tester, and a verdict a non-expert can act on, all open source.
+
 ## Tests
 
 ```

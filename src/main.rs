@@ -1,5 +1,6 @@
 mod canary;
 mod explore;
+mod html;
 mod llm;
 mod report;
 mod sandbox;
@@ -157,8 +158,10 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
     let mut json = r.json();
     json["token"] = s.token.clone().into();
     fs::write(s.dir.join("report.json"), serde_json::to_vec_pretty(&json).map_err(io::Error::other)?)?;
+    let short = report::in_short(&r.findings, r.activity.as_ref().ok().copied());
+    fs::write(s.dir.join("report.html"), html::page(&json, &short))?;
     print!("{}", r.text());
-    println!("\nsession: {}", s.dir.display());
+    println!("\nsession: {}  (report.html to share)", s.dir.display());
     let alarming = r.findings.iter().any(|f| f.kind != report::Kind::Other);
     Ok(if alarming { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }

@@ -22,7 +22,7 @@ fn chouf_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, serde_json::V
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let session = text
         .lines()
-        .find_map(|l| l.strip_prefix("session: "))
+        .find_map(|l| l.strip_prefix("session: ").map(|r| r.split("  (").next().unwrap()))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             panic!(

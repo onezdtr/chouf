@@ -100,6 +100,8 @@ pub struct Finding {
     pub why: String,
     /// The programs that did it (command lines), when the kernel tracer is running.
     pub by: Vec<String>,
+    /// For a secret: its family in plain words ("crypto wallets"), else "".
+    pub group: &'static str,
 }
 
 fn changing(ops: &[Op]) -> bool {
@@ -145,18 +147,15 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
         let bait_inside = canaries
             .iter()
             .find(|c| std::path::Path::new(&c.path).parent() == Some(rel.as_path()));
-        let (kind, why) = if let Some(c) = canaries.iter().find(|c| c.path == rel_s) {
-            (Kind::Secret, c.what.to_string())
+        let (kind, why, group) = if let Some(c) = canaries.iter().find(|c| c.path == rel_s) {
+            (Kind::Secret, c.what.to_string(), c.group)
         } else if let (Some(c), true) = (bait_inside, ops.contains(&Op::List) && !rel_s.is_empty())
         {
-            (
-                Kind::Secret,
-                format!("looked inside the folder of: {}", c.what),
-            )
+            (Kind::Secret, format!("looked inside the folder of: {}", c.what), c.group)
         } else if let (Some(why), true) = (lookup(PERSISTENCE, &path), changing(&ops)) {
-            (Kind::Persistence, why.to_string())
+            (Kind::Persistence, why.to_string(), "")
         } else if changing(&ops) {
-            (Kind::Other, String::new())
+            (Kind::Other, String::new(), "")
         } else {
             continue; // reading ordinary files (a shell reading ~/.bashrc) is not news
         };
@@ -166,6 +165,7 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
             did,
             why,
             by: vec![],
+            group,
         });
     }
     for (list, word) in [
@@ -185,11 +185,67 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
                 did: vec![word],
                 why: why.to_string(),
                 by: vec![],
+                group: "",
             });
         }
     }
     out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
     out
+}
+
+/// What to do about each family of secrets if the program already ran on a real machine.
+fn advice(group: &str) -> &'static str {
+    use crate::canary::*;
+    match group {
+        PASSWORDS => "change the passwords saved in your browsers and password manager, and log out of every site",
+        WALLETS => "move your crypto to a new wallet: the old one's seed and keys must be considered stolen",
+        DEV => "revoke those tokens and keys, then create new ones (cloud, GitHub, npm, PyPI, databases)",
+        CHAT => "log out of every session in those apps (Telegram, Discord, Slack) from another device",
+        _ => "replace your SSH and GPG keys, and remove the old public keys wherever they are trusted",
+    }
+}
+
+/// The report's first lines, for anyone: computed from the measured findings, never from the model.
+pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
+    let secrets: Vec<&Finding> = findings.iter().filter(|f| f.kind == Kind::Secret).collect();
+    let persist = findings.iter().filter(|f| f.kind == Kind::Persistence).count();
+    let trust = findings.iter().filter(|f| f.kind == Kind::Trust).count();
+    let mut groups: Vec<&str> = secrets.iter().map(|f| f.group).filter(|g| !g.is_empty()).collect();
+    groups.sort();
+    groups.dedup();
+    let mut s = String::from("\nIn short\n");
+    if secrets.is_empty() && persist == 0 && trust == 0 {
+        s += "   Nothing alarming: no secret touched, nothing set to run again, nothing new trusted.\n";
+    }
+    if !secrets.is_empty() {
+        s += &format!("   !! It went through your {}: {} bait file{}.\n", groups.join(", "), secrets.len(), if secrets.len() > 1 { "s" } else { "" });
+    }
+    if persist > 0 {
+        s += &format!("   !! It set itself up to run again on its own ({persist} way{}).\n", if persist > 1 { "s" } else { "" });
+    }
+    if trust > 0 {
+        s += "   !! It changed what the machine trusts (software sources, certificates, admin rights or accounts).\n";
+    }
+    if let Some(a) = activity {
+        let mut places: Vec<String> = a.conns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.ip.clone())).collect();
+        places.sort();
+        places.dedup();
+        match places.len() {
+            0 => s += "   It contacted nothing on the network.\n",
+            n => s += &format!("   It contacted {n} place{} on the network: {}.\n", if n > 1 { "s" } else { "" }, places.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
+        }
+    }
+    if !groups.is_empty() || persist > 0 {
+        s += "   If you already ran it on your own machine:\n";
+        for g in &groups {
+            s += &format!("     - {}\n", advice(g));
+        }
+        if persist > 0 {
+            let where_: Vec<&str> = findings.iter().filter(|f| f.kind == Kind::Persistence).map(|f| f.path.as_str()).take(6).collect();
+            s += &format!("     - remove what it set up to come back: {}\n", where_.join(", "));
+        }
+    }
+    s
 }
 
 /// Names the programs behind each finding: "~/x" is /root/x inside the sandbox, system paths are themselves.
@@ -243,7 +299,7 @@ impl Report<'_> {
             "session": self.id, "image": self.image, "command": self.cmd,
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
-            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by})).collect::<Vec<_>>(),
+            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group})).collect::<Vec<_>>(),
             "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
             "exploration": self.exploration.as_ref().map(|x| json!({
                 "model": x.model, "note": x.note,
@@ -276,6 +332,7 @@ impl Report<'_> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        s += &in_short(&self.findings, self.activity.as_ref().ok().copied());
         if let Some(x) = &self.exploration {
             s += "\nHow chouf explored it\n";
             for (i, d) in x.steps.iter().enumerate() {
@@ -405,10 +462,12 @@ mod tests {
             Canary {
                 path: ".ssh/id_ed25519".into(),
                 what: "SSH private key",
+                group: crate::canary::PRIVATE,
             },
             Canary {
                 path: ".aws/credentials".into(),
                 what: "AWS access keys",
+                group: crate::canary::DEV,
             },
         ];
         let home = touches(&[
@@ -447,5 +506,19 @@ mod tests {
         );
         assert_eq!(f[1].why, "SSH private key");
         assert_eq!(f[1].did, vec!["opened", "read"]);
+    }
+
+    #[test]
+    fn in_short_speaks_plainly_and_gives_advice() {
+        let f = |kind, path: &str, group| Finding { kind, path: path.into(), did: vec!["read"], why: String::new(), by: vec![], group };
+        let findings = vec![
+            f(Kind::Secret, "~/.config/Exodus/exodus.wallet/seed.seco", crate::canary::WALLETS),
+            f(Kind::Secret, "~/.config/BraveSoftware/Brave-Browser/Default/Login Data", crate::canary::PASSWORDS),
+            f(Kind::Persistence, "/etc/cron.d/x", ""),
+        ];
+        let s = in_short(&findings, None);
+        assert!(s.contains("It went through your crypto wallets, passwords and browser logins: 2 bait files."), "{s}");
+        assert!(s.contains("run again on its own (1 way)") && s.contains("new wallet") && s.contains("/etc/cron.d/x"), "{s}");
+        assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None).contains("Nothing alarming"));
     }
 }
