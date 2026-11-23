@@ -276,7 +276,8 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
     groups.sort();
     groups.dedup();
     let mut s = String::from("\nIn short\n");
-    if secrets.is_empty() && persist == 0 && trust == 0 {
+    let probed = activity.is_some_and(|a| !a.blocked.is_empty());
+    if secrets.is_empty() && persist == 0 && trust == 0 && !probed {
         s += "   Nothing alarming: no secret touched, nothing set to run again, nothing new trusted.\n";
     }
     if !secrets.is_empty() {
@@ -294,6 +295,12 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
     }
     if findings.iter().any(|f| ["/var/lib/dpkg/", "/var/lib/rpm/", "/usr/lib/sysimage/rpm/"].iter().any(|p| f.path.starts_with(p))) {
         s += "   It installed software with the system's package manager (normal for an installer).\n";
+    }
+    if let Some(a) = activity.filter(|a| !a.blocked.is_empty()) {
+        let mut tries: Vec<String> = a.blocked.iter().map(|b| format!("{}:{}", b.ip, b.port)).collect();
+        tries.dedup();
+        s += &format!("   !! It tried to reach your local network {} time{} (router, other machines): chouf refused. {}\n",
+            a.blocked.len(), if a.blocked.len() > 1 { "s" } else { "" }, tries.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
     }
     if let Some(a) = activity {
         let mut places: Vec<String> = a.conns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.ip.clone())).collect();
@@ -474,6 +481,15 @@ impl Report<'_> {
         }
         match &self.activity {
             Ok(a) => {
+                if !a.blocked.is_empty() {
+                    s += "\nWhat chouf refused on your local network\n";
+                    for b in a.blocked.iter().take(20) {
+                        s += &format!(" ! {}:{} {}  by {}\n", b.ip, b.port, b.proto, a.who(b.pid, i64::MAX));
+                    }
+                    if a.blocked.len() > 20 {
+                        s += &format!("   and {} more\n", a.blocked.len() - 20);
+                    }
+                }
                 if !a.conns.is_empty() {
                     s += "\nWhere it connected\n";
                     for c in a.conns.iter().take(30) {

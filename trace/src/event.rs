@@ -12,6 +12,7 @@ const EV_CONNECT: u8 = 3;
 const EV_UDP: u8 = 4;
 const EV_EXIT: u8 = 5;
 const EV_FORK: u8 = 6;
+const EV_BLOCKED: u8 = 7;
 const AF_INET: u16 = 2;
 const O_ACCMODE: u32 = 3;
 const O_CREAT: u32 = 0o100;
@@ -83,6 +84,13 @@ pub fn decode(b: &[u8], boot_ms: i64) -> Option<(u64, Value)> {
             o.insert("create".into(), (flags & O_CREAT != 0).into());
             o.insert("truncate".into(), (flags & O_TRUNC != 0).into());
             o.insert("directory".into(), (flags & O_DIRECTORY != 0).into());
+        }
+        EV_BLOCKED => {
+            let family = u16_at(b, 32);
+            o.insert("kind".into(), "blocked".into());
+            o.insert("ip".into(), ip(family, &b[40..if family == AF_INET { 44 } else { 56 }]).to_string().into());
+            o.insert("port".into(), u16_at(b, 34).into());
+            o.insert("proto".into(), if flags == 17 { "udp" } else { "tcp" }.into());
         }
         EV_CONNECT | EV_UDP => {
             let family = u16_at(b, 32);

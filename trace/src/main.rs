@@ -74,14 +74,38 @@ pub fn allowed(path: &str, uid: u32) -> Result<(PathBuf, u64)> {
 }
 
 enum Cmd {
-    Watch { id: u64, uid: u32, dir: fs::File, tx: SyncSender<Value>, reply: Sender<Result<(), String>> },
+    Watch { id: u64, uid: u32, dir: fs::File, guard: bool, tx: SyncSender<Value>, reply: Sender<Result<(), String>> },
     Unwatch { id: u64 },
 }
 
 struct Watch {
     uid: u32,
     tx: SyncSender<Value>,
-    _dns: Option<Link>,
+    _links: Vec<Link>,
+}
+
+/// The /64 prefixes of the host's global IPv6 addresses (from /proc/net/if_inet6): the home network's own prefix.
+/// Link-local, loopback and ULA addresses are already refused by range in the kernel side.
+pub fn home_prefixes(if_inet6: &str) -> Vec<[u8; 8]> {
+    let mut out: Vec<[u8; 8]> = Vec::new();
+    for line in if_inet6.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // address, ifindex, prefix length, scope (00 = global), flags, name
+        if f.len() < 6 || f[3] != "00" || f[0].len() != 32 {
+            continue;
+        }
+        let mut p = [0u8; 8];
+        for (i, b) in p.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&f[0][2 * i..2 * i + 2], 16).unwrap_or(0);
+        }
+        if p[0] & 0xfe == 0xfc {
+            continue; // ULA: already private
+        }
+        if !out.contains(&p) && out.len() < 8 {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn client(stream: UnixStream, cmds: Sender<Cmd>) -> Result<()> {
@@ -90,6 +114,7 @@ fn client(stream: UnixStream, cmds: Sender<Cmd>) -> Result<()> {
     BufReader::new(stream.try_clone()?).take(4096).read_line(&mut line)?;
     let mut out = stream.try_clone()?;
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+    let guard = req.get("guard").and_then(Value::as_bool).unwrap_or(false);
     let Some(path) = req.get("watch").and_then(Value::as_str) else {
         writeln!(out, "{}", json!({"error": "expected {\"watch\": \"/sys/fs/cgroup/...\"}"}))?;
         return Ok(());
@@ -103,12 +128,12 @@ fn client(stream: UnixStream, cmds: Sender<Cmd>) -> Result<()> {
     };
     let (tx, rx): (SyncSender<Value>, Receiver<Value>) = mpsc::sync_channel(QUEUE);
     let (rtx, rrx) = mpsc::channel();
-    cmds.send(Cmd::Watch { id, uid, dir: fs::File::open(&p)?, tx, reply: rtx })?;
+    cmds.send(Cmd::Watch { id, uid, dir: fs::File::open(&p)?, guard, tx, reply: rtx })?;
     if let Err(e) = rrx.recv()? {
         writeln!(out, "{}", json!({"error": e}))?;
         return Ok(());
     }
-    writeln!(out, "{}", json!({"watching": p, "cgroup": id}))?;
+    writeln!(out, "{}", json!({"watching": p, "cgroup": id, "guard": guard}))?;
 
     // The client ends the watch by closing its side: notice it even when no event flows.
     let closed = Arc::new(AtomicBool::new(false));
@@ -210,7 +235,7 @@ fn main() -> Result<()> {
         while let Ok(cmd) = crx.try_recv() {
             let mut ws = watches.lock().unwrap();
             match cmd {
-                Cmd::Watch { id, uid, dir, tx, reply } => {
+                Cmd::Watch { id, uid, dir, guard, tx, reply } => {
                     let res = if ws.contains_key(&id) {
                         Err("this cgroup is already watched".to_string())
                     } else if ws.values().filter(|w| w.uid == uid).count() >= MAX_WATCHES_PER_UID {
@@ -218,10 +243,35 @@ fn main() -> Result<()> {
                     } else {
                         skel.maps.watched.update(&id.to_ne_bytes(), &[1], MapFlags::ANY).map_err(|e| e.to_string())
                     };
+                    let mut links = Vec::new();
                     if res.is_ok() {
-                        let dns = skel.progs.on_ingress.attach_cgroup(dir.as_raw_fd()).ok();
-                        ws.insert(id, Watch { uid, tx, _dns: dns });
+                        links.extend(skel.progs.on_ingress.attach_cgroup(dir.as_raw_fd()).ok());
+                    }
+                    let res = if res.is_ok() && guard {
+                        // the home prefix can change (a new router lease): read it for every guarded watch
+                        let prefixes = home_prefixes(&fs::read_to_string("/proc/net/if_inet6").unwrap_or_default());
+                        for i in 0..8u32 {
+                            let mut v = [0u8; 16];
+                            if let Some(p) = prefixes.get(i as usize) {
+                                v[..8].copy_from_slice(p);
+                                v[8] = 1;
+                            }
+                            let _ = skel.maps.lan6_prefixes.update(&i.to_ne_bytes(), &v, MapFlags::ANY);
+                        }
+                        [&skel.progs.guard_connect4, &skel.progs.guard_connect6, &skel.progs.guard_sendmsg4, &skel.progs.guard_sendmsg6]
+                            .iter()
+                            .map(|p| p.attach_cgroup(dir.as_raw_fd()).map(|l| links.push(l)))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(|_| ())
+                            .map_err(|e| format!("could not guard the local network: {e}"))
+                    } else {
+                        res
+                    };
+                    if res.is_ok() {
+                        ws.insert(id, Watch { uid, tx, _links: links });
                         bss.watching = ws.len() as u32;
+                    } else {
+                        let _ = skel.maps.watched.delete(&id.to_ne_bytes());
                     }
                     let _ = reply.send(res);
                 }
@@ -236,3 +286,19 @@ fn main() -> Result<()> {
     let _ = fs::remove_file(SOCK);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_home_prefix_is_read_from_global_addresses_only() {
+        let table = "2a01cb080265f00df6f91efffe11c990 02 40 00 00 wlp3s0\n\
+                     fe80000000000000a2b3fffffe0c1d2e 02 40 20 80 wlp3s0\n\
+                     fd7a115ca1e0000000000000000801ab 05 80 00 80 tailscale0\n\
+                     00000000000000000000000000000001 01 80 10 80 lo\n\
+                     2a01cb080265f00d0000000000000099 02 80 00 80 wlp3s0\n";
+        assert_eq!(home_prefixes(table), vec![[0x2a, 0x01, 0xcb, 0x08, 0x02, 0x65, 0xf0, 0x0d]]);
+    }
+}
+

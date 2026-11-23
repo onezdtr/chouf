@@ -28,6 +28,7 @@ usage: chouf run     [OPTIONS] -- COMMAND [ARGS]...
   --image IMAGE   container image (default ubuntu:24.04)
   --timeout SECS  stop a command after SECS seconds (default 300)
   --no-net        no network at all
+  --allow-lan     let it reach your local network (by default chouf-trace refuses it: router, other machines)
   --file PATH     make PATH available read-only as /input/<name> (repeatable)
   --claim TEXT    explore: what the program is supposed to do (\"installs a GTK theme\")
   --steps N       explore: at most N steps after the first run (default 6)
@@ -44,6 +45,7 @@ struct Opts {
     cmd: Vec<String>,
     claim: Option<String>,
     steps: usize,
+    allow_lan: bool,
 }
 
 fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
@@ -55,6 +57,7 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
         cmd: vec![],
         claim: None,
         steps: explore::MAX_STEPS,
+        allow_lan: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -63,6 +66,7 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
             "--image" => o.image = value("--image")?,
             "--timeout" => o.timeout = Duration::from_secs(value("--timeout")?.parse().map_err(|_| "--timeout: seconds")?),
             "--no-net" => o.net = false,
+            "--allow-lan" => o.allow_lan = true,
             "--file" => o.files.push(PathBuf::from(value("--file")?)),
             "--claim" if explore => o.claim = Some(value("--claim")?),
             "--steps" if explore => o.steps = value("--steps")?.parse().map_err(|_| "--steps: a number")?,
@@ -153,7 +157,7 @@ fn prepare(o: &Opts) -> io::Result<Session> {
 fn tracer_result(t: io::Result<Option<trace::Tracer>>) -> Result<trace::Tracer, String> {
     match t {
         Ok(Some(t)) => Ok(t),
-        Ok(None) => Err("no kernel tracer: install chouf-trace (sudo ./trace/install.sh) to see which program did what and where it connected".into()),
+        Ok(None) => Err("no kernel tracer: install chouf-trace (sudo ./trace/install.sh) to see which program did what and where it connected, and to keep it off your local network".into()),
         Err(e) => Err(format!("kernel tracer unavailable: {e}")),
     }
 }
@@ -167,7 +171,8 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
     fs::write(s.dir.join("report.html"), html::page(&json, &short))?;
     print!("{}", r.text());
     println!("\nsession: {}  (report.html to share)", s.dir.display());
-    let alarming = r.findings.iter().any(|f| f.kind != report::Kind::Other);
+    let probed_lan = r.activity.as_ref().is_ok_and(|a| !a.blocked.is_empty());
+    let alarming = probed_lan || r.findings.iter().any(|f| f.kind != report::Kind::Other);
     Ok(if alarming { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
@@ -184,7 +189,7 @@ fn run(o: Opts) -> io::Result<ExitCode> {
     };
     let created = sandbox::create(&spec)?;
     // before start: the container's cgroup exists from `podman init`, so the program's first instruction is seen
-    let tracer = tracer_result(trace::Tracer::start(&spec.name));
+    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
     let watcher = watch::Watcher::start(&s.home)?;
     let outcome = created.start();
     let touches = watcher.stop()?;
@@ -251,7 +256,7 @@ fn explore(o: Opts) -> io::Result<ExitCode> {
         net: o.net,
     };
     let created = sandbox::create(&spec)?;
-    let tracer = tracer_result(trace::Tracer::start(&spec.name));
+    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
     let watcher = watch::Watcher::start(&s.home)?;
     let live = created.start_live()?;
 

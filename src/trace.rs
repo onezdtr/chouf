@@ -47,14 +47,15 @@ pub struct Tracer {
 
 impl Tracer {
     /// Ok(None) when the service is not installed; Err when it refused.
-    pub fn start(container: &str) -> io::Result<Option<Tracer>> {
+    /// `guard`: the service refuses the sandbox's connections to the local network (DNS excepted) and reports them.
+    pub fn start(container: &str, guard: bool) -> io::Result<Option<Tracer>> {
         let sock = std::env::var("CHOUF_TRACE_SOCK").unwrap_or_else(|_| SOCK.to_string());
         let Ok(stream) = UnixStream::connect(sock) else {
             return Ok(None);
         };
         let cg = cgroup_of(container)?;
         let mut w = stream.try_clone()?;
-        writeln!(w, "{}", json!({"watch": cg}))?;
+        writeln!(w, "{}", json!({"watch": cg, "guard": guard}))?;
         let mut r = BufReader::new(stream.try_clone()?);
         let mut first = String::new();
         r.read_line(&mut first)?;
@@ -127,11 +128,21 @@ pub struct Conn {
     pub name: Option<String>,
 }
 
+/// A connection to the local network that the guard refused.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Blocked {
+    pub pid: u32,
+    pub ip: String,
+    pub port: u64,
+    pub proto: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Activity {
     pub procs: BTreeMap<u32, Proc>,
     pub opens: Vec<Open>,
     pub conns: Vec<Conn>,
+    pub blocked: Vec<Blocked>,
     pub lost: bool,
 }
 
@@ -193,6 +204,17 @@ impl Activity {
                     }
                     if seen_conns.insert((pid, ip.clone(), port, k)) {
                         a.conns.push(Conn { pid, proto: if k == "connect" { "tcp" } else { "udp" }, name: names.get(&ip).cloned(), ip, port });
+                    }
+                }
+                Some("blocked") => {
+                    let b = Blocked {
+                        pid,
+                        ip: e["ip"].as_str().unwrap_or("").into(),
+                        port: e["port"].as_u64().unwrap_or(0),
+                        proto: e["proto"].as_str().unwrap_or("tcp").into(),
+                    };
+                    if !a.blocked.contains(&b) {
+                        a.blocked.push(b);
                     }
                 }
                 Some("dns") => {
@@ -302,6 +324,7 @@ impl Activity {
         json!({
             "programs": self.tree().iter().map(|(d, c, x)| json!({"depth": d, "command": c, "exit": x})).collect::<Vec<_>>(),
             "connections": self.conns.iter().map(|c| json!({"by": self.who(c.pid, i64::MAX), "proto": c.proto, "ip": c.ip, "port": c.port, "name": c.name})).collect::<Vec<_>>(),
+            "blocked": self.blocked.iter().map(|b| json!({"by": self.who(b.pid, i64::MAX), "ip": b.ip, "port": b.port, "proto": b.proto})).collect::<Vec<_>>(),
             "events_lost": self.lost,
         })
     }

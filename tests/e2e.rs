@@ -165,3 +165,24 @@ fn the_explorer_types_answers_waits_and_reports_its_verdict() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The guard: the sandbox cannot reach the local network (private ranges), the attempt is reported and named.
+#[test]
+#[ignore]
+fn the_local_network_is_out_of_reach() {
+    if !std::path::Path::new("/run/chouf-trace.sock").exists() {
+        eprintln!("skipped: chouf-trace is not running");
+        return;
+    }
+    let script = "bash -c 'exec 3<>/dev/tcp/10.255.255.1/80' 2>/dev/null && exit 7; exit 0";
+    let (code, text, j) = chouf(&["run", "--", "sh", "-c", script]);
+    assert_eq!(j["exit_code"], 0, "the connection went through:\n{text}");
+    assert_eq!(code, 1, "probing the local network is an alarm:\n{text}");
+    let b = &j["activity"]["blocked"][0];
+    assert_eq!((b["ip"].as_str(), b["port"].as_u64(), b["proto"].as_str()), (Some("10.255.255.1"), Some(80), Some("tcp")), "{text}");
+    assert!(b["by"].as_str().unwrap().starts_with("bash -c exec 3<>/dev/tcp/10.255.255.1/80"), "{text}");
+    assert!(text.contains("It tried to reach your local network 1 time") && !text.contains("Nothing alarming"), "{text}");
+    // and with --allow-lan the guard is off: nothing is refused
+    let (_, text, j) = chouf(&["run", "--allow-lan", "--timeout", "20", "--", "sh", "-c", "timeout 3 bash -c 'exec 3<>/dev/tcp/10.255.255.1/80' 2>/dev/null; exit 0"]);
+    assert!(j["activity"]["blocked"].as_array().unwrap().is_empty(), "{text}");
+}
+

@@ -22,7 +22,7 @@
 #define ARGS_LEN 256
 #define MAX_DEPTH 16
 
-enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5, EV_FORK = 6 };
+enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5, EV_FORK = 6, EV_BLOCKED = 7 };
 
 // Shared with userspace (src/event.rs): 584 bytes, no implicit padding.
 struct event {
@@ -84,6 +84,21 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } drops SEC(".maps");
+
+// The /64 prefixes of the host's own global IPv6 addresses: in IPv6 the home network's machines have public
+// addresses in the router's prefix, so "private" ranges alone do not keep a sandbox away from them. Set by userspace.
+struct lan6 {
+	u8 prefix[8];
+	u8 used;
+	u8 _pad[7];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 8);
+	__type(key, u32);
+	__type(value, struct lan6);
+} lan6_prefixes SEC(".maps");
 
 // Number of watched cgroups, set by userspace. Zero: every hook returns after one load.
 volatile u32 watching;
@@ -345,5 +360,86 @@ int on_ingress(struct __sk_buff *skb)
 	bpf_ringbuf_submit(e, 0);
 	return 1;
 }
+
+// --- the guard: a sandbox reaches the internet, never the local network ------------------------------------------
+// Attached by the daemon to a guarded cgroup only. Returning 0 refuses the connect() or sendmsg() (EPERM).
+// DNS (port 53) stays open: the sandbox's resolvers sit on private addresses.
+
+static __always_inline int private4(u32 ip) // host byte order
+{
+	return (ip >> 24) == 10 || (ip >> 20) == 0xac1 || (ip >> 16) == 0xc0a8 || (ip >> 22) == (100 << 2 | 1) ||
+	       (ip >> 16) == 0xa9fe || (ip >> 28) == 0xe || ip == 0xffffffff || (ip >> 24) == 0;
+}
+
+static __always_inline int private6(const u32 *a) // network byte order words
+{
+	u32 w0 = bpf_ntohl(a[0]);
+	if ((w0 >> 25) == (0xfc >> 1) || (w0 >> 22) == (0xfe80 >> 6) || (w0 >> 24) == 0xff)
+		return 1;
+	if (a[0] == 0 && a[1] == 0 && bpf_ntohl(a[2]) == 0xffff) // ::ffff:a.b.c.d
+		return private4(bpf_ntohl(a[3]));
+	for (u32 i = 0; i < 8; i++) {
+		u32 k = i;
+		struct lan6 *l = bpf_map_lookup_elem(&lan6_prefixes, &k);
+		if (!l || !l->used)
+			break;
+		if (__builtin_memcmp(l->prefix, a, 8) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static __always_inline void report_block(u16 family, const void *addr, u16 port, u32 proto)
+{
+	u64 cg = watched_cgroup();
+	struct event *e = reserve(EV_BLOCKED, cg);
+	if (!e)
+		return;
+	e->family = family;
+	e->dport = port;
+	e->flags = proto;
+	if (family == AF_INET)
+		__builtin_memcpy(e->daddr, addr, 4);
+	else
+		__builtin_memcpy(e->daddr, addr, 16);
+	bpf_ringbuf_submit(e, 0);
+}
+
+static __always_inline int guard4(struct bpf_sock_addr *ctx, u32 proto)
+{
+	u32 ip = ctx->user_ip4;
+	u16 port = bpf_ntohs((u16)ctx->user_port);
+	if (port == DNS_PORT || (bpf_ntohl(ip) >> 24) == 127 || !private4(bpf_ntohl(ip)))
+		return 1;
+	report_block(AF_INET, &ip, port, proto);
+	return 0;
+}
+
+static __always_inline int guard6(struct bpf_sock_addr *ctx, u32 proto)
+{
+	u32 a[4];
+	a[0] = ctx->user_ip6[0];
+	a[1] = ctx->user_ip6[1];
+	a[2] = ctx->user_ip6[2];
+	a[3] = ctx->user_ip6[3];
+	u16 port = bpf_ntohs((u16)ctx->user_port);
+	int loopback = a[0] == 0 && a[1] == 0 && a[2] == 0 && bpf_ntohl(a[3]) == 1;
+	if (port == DNS_PORT || loopback || !private6(a))
+		return 1;
+	report_block(AF_INET6, a, port, proto);
+	return 0;
+}
+
+SEC("cgroup/connect4")
+int guard_connect4(struct bpf_sock_addr *ctx) { return guard4(ctx, PROTO_TCP); }
+
+SEC("cgroup/connect6")
+int guard_connect6(struct bpf_sock_addr *ctx) { return guard6(ctx, PROTO_TCP); }
+
+SEC("cgroup/sendmsg4")
+int guard_sendmsg4(struct bpf_sock_addr *ctx) { return guard4(ctx, PROTO_UDP); }
+
+SEC("cgroup/sendmsg6")
+int guard_sendmsg6(struct bpf_sock_addr *ctx) { return guard6(ctx, PROTO_UDP); }
 
 char LICENSE[] SEC("license") = "GPL";

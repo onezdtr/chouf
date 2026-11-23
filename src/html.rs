@@ -123,6 +123,13 @@ pub fn page(r: &Value, in_short: &str) -> String {
         }
         h += "</section>";
     }
+    if let Some(blocked) = a["blocked"].as_array().filter(|b| !b.is_empty()) {
+        h += "<section><h2>What chouf refused on your local network</h2>";
+        for b in blocked.iter().take(50) {
+            h += &format!("<div class=\"f\"><span class=\"bad mono\">{}:{} {}</span><div class=\"by mono\">by {}</div></div>", text(&b["ip"]), b["port"], text(&b["proto"]), text(&b["by"]));
+        }
+        h += "</section>";
+    }
     if let Some(progs) = a["programs"].as_array().filter(|p| !p.is_empty()) {
         h += &format!("<section class=\"tree\"><h2>Programs it ran ({})</h2>", progs.len());
         for p in progs.iter().take(200) {
