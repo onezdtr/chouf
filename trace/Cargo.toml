@@ -1,6 +1,6 @@
 [package]
 name = "chouf-trace"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Root helper for chouf: traces what the processes of one sandbox do (exec, files, connections, DNS)"
 license = "GPL-2.0-only"

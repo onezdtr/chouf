@@ -1,6 +1,6 @@
 [package]
 name = "chouf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Run a program in a throwaway sandbox full of bait secrets and see what it really does"
 license = "GPL-2.0-only"
