@@ -3,6 +3,10 @@
 *chouf* (« look » in Darija) runs a program in a throwaway sandbox full of **bait secrets** and tells you, in plain words,
 what it really did: which secrets it went after, how it will start again by itself, what it now trusts.
 
+![chouf catching a fake theme installer that sends the AWS keys and the SSH key to example.com](docs/demo.gif)
+
+Website: https://onezdtr.github.io/chouf
+
 ```
 $ chouf run --file install-theme.sh -- sh /input/install-theme.sh
 
@@ -98,8 +102,6 @@ What it says vs what it does  (opinion of gemini-3.1-flash-lite, not a measureme
   seen from outside, without root, including files written into folders created a microsecond earlier.
 
 ## Install
-
-Website: https://onezdtr.github.io/chouf
 
 ```
 curl -fsSL https://raw.githubusercontent.com/onezdtr/chouf/main/get.sh | sudo sh    # latest release, x86_64 or aarch64
