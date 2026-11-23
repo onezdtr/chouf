@@ -1,0 +1,19 @@
+[Unit]
+Description=chouf-trace: kernel tracer for chouf sandboxes (each user sees only their own)
+Documentation=https://github.com/onezdtr/chouf
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/chouf-trace
+Restart=on-failure
+RestartSec=3
+# Loads eBPF and attaches to cgroups: needs root, but nothing else of the system.
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

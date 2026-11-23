@@ -22,7 +22,7 @@
 #define ARGS_LEN 256
 #define MAX_DEPTH 16
 
-enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5 };
+enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5, EV_FORK = 6 };
 
 // Shared with userspace (src/event.rs): 584 bytes, no implicit padding.
 struct event {
@@ -152,6 +152,25 @@ int BPF_PROG(on_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm 
 	// flags = how many bytes of args are real: the rest of the buffer is not cleared and must never be read.
 	if (len > 0 && len < ARGS_LEN && !bpf_probe_read_user(e->args, len, (void *)start))
 		e->flags = len;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+// A new process (not a thread): a subshell running `$(cat ~/.ssh/id_rsa)` never execs, but its children must
+// still hang under the script that started it.
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
+{
+	if (BPF_CORE_READ(child, pid) != BPF_CORE_READ(child, tgid))
+		return 0;
+	u64 cg = watched_cgroup();
+	if (!cg)
+		return 0;
+	struct event *e = reserve(EV_FORK, cg);
+	if (!e)
+		return 0;
+	e->tgid = BPF_CORE_READ(child, tgid);
+	e->ppid = BPF_CORE_READ(parent, tgid);
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }

@@ -11,6 +11,7 @@ const EV_OPEN: u8 = 2;
 const EV_CONNECT: u8 = 3;
 const EV_UDP: u8 = 4;
 const EV_EXIT: u8 = 5;
+const EV_FORK: u8 = 6;
 const AF_INET: u16 = 2;
 const O_ACCMODE: u32 = 3;
 const O_CREAT: u32 = 0o100;
@@ -88,6 +89,10 @@ pub fn decode(b: &[u8], boot_ms: i64) -> Option<(u64, Value)> {
             o.insert("kind".into(), if kind == EV_CONNECT { "connect" } else { "udp" }.into());
             o.insert("ip".into(), ip(family, &b[40..if family == AF_INET { 44 } else { 56 }]).to_string().into());
             o.insert("port".into(), u16_at(b, 34).into());
+        }
+        EV_FORK => {
+            o.insert("kind".into(), "fork".into());
+            o.insert("ppid".into(), u32_at(b, 20).into());
         }
         EV_EXIT => {
             o.insert("kind".into(), "exit".into());

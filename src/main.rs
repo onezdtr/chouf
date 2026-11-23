@@ -1,6 +1,7 @@
 mod canary;
 mod report;
 mod sandbox;
+mod trace;
 mod watch;
 
 use std::env;
@@ -132,22 +133,34 @@ fn run(o: RunOpts) -> io::Result<ExitCode> {
         net: o.net,
     };
     let created = sandbox::create(&spec)?;
+    // before start: the container's cgroup exists from `podman init`, so the program's first instruction is seen
+    let tracer = trace::Tracer::start(&spec.name);
     let watcher = watch::Watcher::start(&home)?;
     let outcome = created.start();
     let touches = watcher.stop()?;
+    let activity: Result<trace::Activity, String> = match tracer {
+        Ok(Some(t)) => Ok(t.stop()),
+        Ok(None) => Err(format!("no kernel tracer: install chouf-trace (sudo ./trace/install.sh) to see which program did what and where it connected")),
+        Err(e) => Err(format!("kernel tracer unavailable: {e}")),
+    };
     let mut outcome = outcome?;
     let mut noise = noise;
     noise.insert("/input".into()); // our own mount point
     outcome.fs = sandbox::interesting(std::mem::take(&mut outcome.fs), &noise);
 
+    let mut findings = report::findings(&canaries, &touches, &outcome.fs);
+    if let Ok(a) = &activity {
+        report::attribute(&mut findings, a);
+    }
     let report = report::Report {
         id: &id,
         image: &o.image,
         cmd: &o.cmd,
         outcome: &outcome,
-        findings: report::findings(&canaries, &touches, &outcome.fs),
+        findings,
         transient: report::transient_count(&touches),
         incomplete: touches.incomplete,
+        activity: activity.as_ref().map_err(Clone::clone),
     };
     let mut json = report.json();
     json["token"] = token.clone().into();

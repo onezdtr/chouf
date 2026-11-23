@@ -2,6 +2,7 @@
 
 use crate::canary::Canary;
 use crate::sandbox::{FsDiff, Outcome};
+use crate::trace::Activity;
 use crate::watch::{Op, Touches};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -96,6 +97,8 @@ pub struct Finding {
     /// "read", "added", ...
     pub did: Vec<&'static str>,
     pub why: String,
+    /// The programs that did it (command lines), when the kernel tracer is running.
+    pub by: Vec<String>,
 }
 
 fn changing(ops: &[Op]) -> bool {
@@ -161,6 +164,7 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
             path,
             did,
             why,
+            by: vec![],
         });
     }
     for (list, word) in [
@@ -179,11 +183,23 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
                 path: p.clone(),
                 did: vec![word],
                 why: why.to_string(),
+                by: vec![],
             });
         }
     }
     out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
     out
+}
+
+/// Names the programs behind each finding: "~/x" is /root/x inside the sandbox, system paths are themselves.
+pub fn attribute(findings: &mut [Finding], a: &Activity) {
+    for f in findings {
+        let inside = match f.path.strip_prefix('~') {
+            Some(rest) => format!("/root{rest}"),
+            None => f.path.clone(),
+        };
+        f.by = a.openers(&inside).0;
+    }
 }
 
 /// How a shell would need the argument written: what the report shows must be what ran.
@@ -206,6 +222,8 @@ pub struct Report<'a> {
     pub findings: Vec<Finding>,
     pub incomplete: bool,
     pub transient: usize,
+    /// What the kernel tracer saw, or why there is nothing.
+    pub activity: Result<&'a Activity, String>,
 }
 
 impl Report<'_> {
@@ -215,7 +233,8 @@ impl Report<'_> {
             "session": self.id, "image": self.image, "command": self.cmd,
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
-            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why})).collect::<Vec<_>>(),
+            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by})).collect::<Vec<_>>(),
+            "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
         })
     }
 
@@ -254,6 +273,47 @@ impl Report<'_> {
                 format!("  ({})", f.why)
             };
             s += &format!(" {mark} {:<9} {}{}\n", f.did.join(", "), f.path, why);
+            for b in f.by.iter().take(3) {
+                s += &format!("   {:<9} by {b}\n", "");
+            }
+            if f.by.len() > 3 {
+                s += &format!("   {:<9} and {} more\n", "", f.by.len() - 3);
+            }
+        }
+        match &self.activity {
+            Ok(a) => {
+                if !a.conns.is_empty() {
+                    s += "\nWhere it connected\n";
+                    for c in a.conns.iter().take(30) {
+                        let dest = match &c.name {
+                            Some(n) => format!("{n} ({})", c.ip),
+                            None => c.ip.clone(),
+                        };
+                        s += &format!("   {dest} port {} {}  by {}\n", c.port, c.proto, a.who(c.pid, i64::MAX));
+                    }
+                    if a.conns.len() > 30 {
+                        s += &format!("   and {} more\n", a.conns.len() - 30);
+                    }
+                }
+                let tree = a.tree();
+                if !tree.is_empty() {
+                    s += &format!("\nPrograms it ran ({})\n", tree.len());
+                    for (depth, cmd, exit) in tree.iter().take(40) {
+                        let code = match exit {
+                            Some(0) | None => String::new(),
+                            Some(c) => format!("  (exit {c})"),
+                        };
+                        s += &format!("   {}{cmd}{code}\n", "  ".repeat((*depth).min(8)));
+                    }
+                    if tree.len() > 40 {
+                        s += &format!("   and {} more (report.json has them all)\n", tree.len() - 40);
+                    }
+                }
+                if a.lost {
+                    s += "\nWarning: the kernel tracer lost events, the lists above may be incomplete.\n";
+                }
+            }
+            Err(why) => s += &format!("\n({why})\n"),
         }
         if self.transient > 0 {
             s += &format!(

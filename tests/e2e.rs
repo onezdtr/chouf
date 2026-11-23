@@ -6,12 +6,17 @@ use std::process::Command;
 static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn chouf(args: &[&str]) -> (i32, String, serde_json::Value) {
+    chouf_env(args, &[])
+}
+
+fn chouf_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, serde_json::Value) {
     // tests run in parallel: each run gets its own data directory
     let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let data = std::env::temp_dir().join(format!("chouf-e2e-{}-{n}", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_chouf"))
         .args(args)
         .env("XDG_DATA_HOME", &data)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -84,4 +89,45 @@ fn the_time_limit_holds() {
     assert_eq!(j["timed_out"], true, "{text}");
     assert!(j["exit_code"].is_null());
     assert!(t.elapsed().as_secs() < 30);
+}
+
+/// Needs the kernel tracer too (sudo ./trace/install.sh); skipped with a message when it is not running.
+#[test]
+#[ignore]
+fn the_tracer_names_who_did_it_and_where_it_connected() {
+    if !std::path::Path::new("/run/chouf-trace.sock").exists() {
+        eprintln!("skipped: chouf-trace is not running");
+        return;
+    }
+    // a subshell reads the key, a child of the script writes .bashrc, bash connects to the sandbox's DNS forwarder
+    let script = "k=$(cat ~/.ssh/id_ed25519); sh -c 'echo x >> ~/.bashrc'; \
+                  bash -c 'exec 3<>/dev/tcp/169.254.1.1/53' 2>/dev/null; exit 3";
+    let (code, text, j) = chouf(&["run", "--", "sh", "-c", script]);
+    assert_eq!(code, 1, "{text}");
+    let by = |path: &str| -> Vec<String> {
+        let f = j["findings"].as_array().unwrap().iter().find(|f| f["path"] == path).unwrap_or_else(|| panic!("{path}:\n{text}"));
+        f["by"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(by("~/.ssh/id_ed25519"), vec!["cat /root/.ssh/id_ed25519"], "{text}");
+    assert_eq!(by("~/.bashrc"), vec!["sh -c echo x >> ~/.bashrc"], "{text}");
+    let a = &j["activity"];
+    let programs: Vec<(u64, &str)> = a["programs"].as_array().unwrap().iter()
+        .map(|p| (p["depth"].as_u64().unwrap(), p["command"].as_str().unwrap())).collect();
+    assert_eq!(programs[0].0, 0, "{text}");
+    assert!(programs[0].1.starts_with("sh -c k=$(cat"), "{text}");
+    for child in ["cat /root/.ssh/id_ed25519", "sh -c echo x >> ~/.bashrc", "bash -c exec 3<>/dev/tcp/169.254.1.1/53"] {
+        assert!(programs.contains(&(1, child)), "{child} not under the script:\n{text}");
+    }
+    assert_eq!(a["programs"][0]["exit"], 3, "the script's exit code:\n{text}");
+    let conns = a["connections"].as_array().unwrap();
+    assert!(conns.iter().any(|c| c["ip"] == "169.254.1.1" && c["port"] == 53 && c["by"].as_str().unwrap().starts_with("bash -c")), "{text}");
+    assert_eq!(a["events_lost"], false);
+}
+
+#[test]
+#[ignore]
+fn without_the_tracer_the_report_says_so() {
+    // a socket path nobody serves stands for "not installed"
+    let (_, text, j) = chouf_env(&["run", "--no-net", "--", "true"], &[("CHOUF_TRACE_SOCK", "/nonexistent/chouf-trace.sock")]);
+    assert!(j["activity"]["unavailable"].as_str().unwrap().contains("chouf-trace"), "{text}");
 }
