@@ -1,0 +1,70 @@
+name: release
+
+# A tag v* builds chouf and its kernel tracer for x86_64 and aarch64 (libbpf, libelf, zlib linked into the tracer;
+# glibc >= 2.35), runs the unit tests, and publishes them as a release that get.sh installs.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: x86_64, bpftool: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64, bpftool: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm autoconf automake autopoint libtool flex bison gawk pkg-config make
+
+      - name: bpftool (generates vmlinux.h from the runner kernel's BTF)
+        run: |
+          v=v7.8.1
+          f=bpftool-$v-${{ matrix.bpftool }}.tar.gz
+          curl -fsSLO https://github.com/libbpf/bpftool/releases/download/$v/$f
+          curl -fsSLO https://github.com/libbpf/bpftool/releases/download/$v/$f.sha256sum
+          sha256sum -c $f.sha256sum
+          tar xzf $f
+          sudo install -m 755 bpftool /usr/local/bin/bpftool
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and test
+        run: |
+          cargo build --release --workspace --features chouf-trace/static
+          cargo test --release --workspace --features chouf-trace/static
+
+      - name: Package
+        run: |
+          d=chouf-${GITHUB_REF_NAME}-${{ matrix.arch }}
+          mkdir "$d"
+          cp target/release/chouf target/release/chouf-trace install.sh trace/chouf-trace.service LICENSE README.md "$d/"
+          ldd "$d/chouf-trace"
+          tar czf "$d.tar.gz" --owner=0 --group=0 "$d"
+          sha256sum "$d.tar.gz" > "$d.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: chouf-*.tar.gz*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" chouf-*.tar.gz* --repo "$GITHUB_REPOSITORY" --title "chouf $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
