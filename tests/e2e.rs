@@ -15,7 +15,7 @@ fn chouf_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, serde_json::V
     let data = std::env::temp_dir().join(format!("chouf-e2e-{}-{n}", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_chouf"))
         .args(args)
-        .env("XDG_DATA_HOME", &data)
+        .env("CHOUF_DATA", &data)
         .envs(env.iter().copied())
         .output()
         .unwrap();

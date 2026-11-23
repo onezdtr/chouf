@@ -79,7 +79,12 @@ fn parse(args: &[String], explore: bool) -> Result<Opts, String> {
     Ok(o)
 }
 
+/// Where sessions are kept: CHOUF_DATA, else $XDG_DATA_HOME/chouf. (Tests set CHOUF_DATA: changing XDG_DATA_HOME
+/// would also move podman's image store, and every test would pull its own copy of the image.)
 fn data_dir() -> PathBuf {
+    if let Some(d) = env::var_os("CHOUF_DATA") {
+        return PathBuf::from(d);
+    }
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".local/share"))

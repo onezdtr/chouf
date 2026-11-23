@@ -100,10 +100,10 @@ pub fn page(r: &Value, in_short: &str) -> String {
                 "<div class=\"f\"><span class=\"{}\">{}</span> <span class=\"path mono\">{}</span>{}",
                 if kind == "other" { "note" } else { "bad" },
                 did.join(", "),
-                text(&f["path"]),
+                match f["count"].as_u64() { Some(n) if n > 1 => format!("{n} files in {}", text(&f["path"])), _ => text(&f["path"]) },
                 if why.is_empty() { String::new() } else { format!(" <span class=\"note\">({why})</span>") }
             );
-            for b in f["by"].as_array().into_iter().flatten().take(3) {
+            for b in f["by"].as_array().into_iter().flatten().take(if kind == "other" { 0 } else { 3 }) {
                 h += &format!("<div class=\"by mono\">by {}</div>", text(b));
             }
             h += "</div>";

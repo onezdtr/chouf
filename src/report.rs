@@ -6,6 +6,7 @@ use crate::explore::{describe_short, Done, Verdict};
 use crate::trace::Activity;
 use crate::watch::{Op, Touches};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,6 +103,8 @@ pub struct Finding {
     pub by: Vec<String>,
     /// For a secret: its family in plain words ("crypto wallets"), else "".
     pub group: &'static str,
+    /// How many files this line stands for: more than 1 when siblings were folded into their folder.
+    pub count: usize,
 }
 
 fn changing(ops: &[Op]) -> bool {
@@ -166,6 +169,7 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
             why,
             by: vec![],
             group,
+            count: 1,
         });
     }
     for (list, word) in [
@@ -186,7 +190,65 @@ pub fn findings(canaries: &[Canary], home: &Touches, sys: &FsDiff) -> Vec<Findin
                 why: why.to_string(),
                 by: vec![],
                 group: "",
+                count: 1,
             });
+        }
+    }
+    standard_certificates(&mut out, sys);
+    out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
+    fold(out)
+}
+
+const CERTS: &str = "/etc/ssl/certs/";
+const MOZILLA: &str = "/usr/share/ca-certificates/mozilla/";
+
+/// Installing the `ca-certificates` package (pulled in by curl, git, pip…) writes the standard Mozilla roots and links
+/// each one into /etc/ssl/certs. Those links are not a new trust: they are classed as ordinary when the Mozilla files
+/// came in the same run, one link per root at most. A certificate that matches no Mozilla file, or any certificate
+/// dropped in /usr/local/share/ca-certificates (where a custom root goes), stays an alarm.
+fn standard_certificates(out: &mut [Finding], sys: &FsDiff) {
+    let roots: std::collections::BTreeSet<&str> = sys
+        .added
+        .iter()
+        .filter_map(|p| p.strip_prefix(MOZILLA)?.strip_suffix(".crt"))
+        .collect();
+    if roots.is_empty() || sys.added.iter().any(|p| p.starts_with("/usr/local/share/ca-certificates/") && p.len() > 33) {
+        return;
+    }
+    let hashes = out.iter().filter(|f| f.path.starts_with(CERTS) && f.path.ends_with(".0")).count();
+    for f in out.iter_mut().filter(|f| f.kind == Kind::Trust && f.path.starts_with(CERTS)) {
+        let name = &f.path[CERTS.len()..];
+        let standard = name == "ca-certificates.crt"
+            || name.strip_suffix(".pem").is_some_and(|n| roots.contains(n))
+            || (name.ends_with(".0") && hashes <= roots.len());
+        if standard {
+            f.kind = Kind::Other;
+            f.why = "standard root certificates (ca-certificates package)".into();
+        }
+    }
+}
+
+/// Ordinary changes printed in the terminal before "and N more".
+const OTHER_LINES: usize = 15;
+
+/// More than FOLD lines of the same kind in one folder become one line for that folder (report.json keeps the count).
+const FOLD: usize = 5;
+
+fn fold(list: Vec<Finding>) -> Vec<Finding> {
+    let parent = |p: &str| p.rfind('/').map(|i| p[..=i].to_string()).unwrap_or_default();
+    let mut groups: BTreeMap<(Kind, String, Vec<&'static str>, String, &'static str), Vec<Finding>> = BTreeMap::new();
+    for f in list {
+        groups.entry((f.kind, parent(&f.path), f.did.clone(), f.why.clone(), f.group)).or_default().push(f);
+    }
+    let mut out = Vec::new();
+    for ((kind, dir, did, why, group), fs) in groups {
+        if fs.len() > FOLD && kind != Kind::Secret {
+            let mut by: Vec<String> = fs.iter().flat_map(|f| f.by.iter().cloned()).collect();
+            by.sort();
+            by.dedup();
+            out.push(Finding { kind, path: dir, did, why, by, group, count: fs.len() });
+        } else {
+            out.extend(fs);
         }
     }
     out.sort_by(|a, b| (a.kind, &a.path).cmp(&(b.kind, &b.path)));
@@ -225,6 +287,9 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
     }
     if trust > 0 {
         s += "   !! It changed what the machine trusts (software sources, certificates, admin rights or accounts).\n";
+    }
+    if findings.iter().any(|f| ["/var/lib/dpkg/", "/var/lib/rpm/", "/usr/lib/sysimage/rpm/"].iter().any(|p| f.path.starts_with(p))) {
+        s += "   It installed software with the system's package manager (normal for an installer).\n";
     }
     if let Some(a) = activity {
         let mut places: Vec<String> = a.conns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.ip.clone())).collect();
@@ -299,7 +364,7 @@ impl Report<'_> {
             "session": self.id, "image": self.image, "command": self.cmd,
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
-            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group})).collect::<Vec<_>>(),
+            "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count})).collect::<Vec<_>>(),
             "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
             "exploration": self.exploration.as_ref().map(|x| json!({
                 "model": x.model, "note": x.note,
@@ -346,10 +411,22 @@ impl Report<'_> {
             s += "\nNothing: no bait touched, no file changed.\n";
         }
         let mut last = None;
+        let others = self.findings.iter().filter(|f| f.kind == Kind::Other).count();
+        let mut shown_others = 0;
         for f in &self.findings {
             if last != Some(f.kind) {
                 s += &format!("\n{}\n", f.kind.title());
                 last = Some(f.kind);
+            }
+            // ordinary changes: a short sample in the terminal, all of them in report.json and report.html
+            if f.kind == Kind::Other {
+                shown_others += 1;
+                if shown_others > OTHER_LINES {
+                    if shown_others == OTHER_LINES + 1 {
+                        s += &format!("   and {} more (report.html has them all)\n", others - OTHER_LINES);
+                    }
+                    continue;
+                }
             }
             let mark = if f.kind == Kind::Other { " " } else { "!" };
             let why = if f.why.is_empty() {
@@ -357,12 +434,15 @@ impl Report<'_> {
             } else {
                 format!("  ({})", f.why)
             };
-            s += &format!(" {mark} {:<9} {}{}\n", f.did.join(", "), f.path, why);
-            for b in f.by.iter().take(3) {
+            let path = if f.count > 1 { format!("{} files in {}", f.count, f.path) } else { f.path.clone() };
+            s += &format!(" {mark} {:<9} {}{}\n", f.did.join(", "), path, why);
+            // who did it matters for an alarm; for an ordinary change it is noise
+            let by: &[String] = if f.kind == Kind::Other { &[] } else { &f.by };
+            for b in by.iter().take(3) {
                 s += &format!("   {:<9} by {b}\n", "");
             }
-            if f.by.len() > 3 {
-                s += &format!("   {:<9} and {} more\n", "", f.by.len() - 3);
+            if by.len() > 3 {
+                s += &format!("   {:<9} and {} more\n", "", by.len() - 3);
             }
         }
         match &self.activity {
@@ -510,7 +590,7 @@ mod tests {
 
     #[test]
     fn in_short_speaks_plainly_and_gives_advice() {
-        let f = |kind, path: &str, group| Finding { kind, path: path.into(), did: vec!["read"], why: String::new(), by: vec![], group };
+        let f = |kind, path: &str, group| Finding { kind, path: path.into(), did: vec!["read"], why: String::new(), by: vec![], group, count: 1 };
         let findings = vec![
             f(Kind::Secret, "~/.config/Exodus/exodus.wallet/seed.seco", crate::canary::WALLETS),
             f(Kind::Secret, "~/.config/BraveSoftware/Brave-Browser/Default/Login Data", crate::canary::PASSWORDS),
@@ -520,5 +600,27 @@ mod tests {
         assert!(s.contains("It went through your crypto wallets, passwords and browser logins: 2 bait files."), "{s}");
         assert!(s.contains("run again on its own (1 way)") && s.contains("new wallet") && s.contains("/etc/cron.d/x"), "{s}");
         assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None).contains("Nothing alarming"));
+    }
+
+    #[test]
+    fn the_standard_certificate_bundle_is_not_a_new_trust_but_a_custom_root_is() {
+        let mut added: Vec<String> = (0..8).map(|i| format!("/usr/share/ca-certificates/mozilla/Root_{i}.crt")).collect();
+        added.extend((0..8).map(|i| format!("/etc/ssl/certs/Root_{i}.pem")));
+        added.extend((0..8).map(|i| format!("/etc/ssl/certs/{i:08x}.0")));
+        added.push("/etc/ssl/certs/ca-certificates.crt".into());
+        added.push("/etc/ssl/certs/Evil_CA.pem".into());
+        let sys = FsDiff { added: added.clone(), changed: vec![], deleted: vec![] };
+        let f = findings(&[], &Touches::default(), &sys);
+        let trust: Vec<&str> = f.iter().filter(|f| f.kind == Kind::Trust).map(|f| f.path.as_str()).collect();
+        assert_eq!(trust, vec!["/etc/ssl/certs/Evil_CA.pem"], "only the root that is not Mozilla's stays an alarm");
+        // the 17 ordinary links fold into one line, the 8 Mozilla files into another
+        let certs = f.iter().find(|f| f.kind == Kind::Other && f.path == "/etc/ssl/certs/").unwrap();
+        assert_eq!((certs.count, certs.why.as_str()), (17, "standard root certificates (ca-certificates package)"));
+        // a custom root in the local folder: nothing is excused
+        let mut sys = sys;
+        sys.added.push("/usr/local/share/ca-certificates/corp.crt".into());
+        let f = findings(&[], &Touches::default(), &sys);
+        let alarms: usize = f.iter().filter(|f| f.kind == Kind::Trust && f.path.starts_with("/etc/ssl/certs/")).map(|f| f.count).sum();
+        assert_eq!(alarms, 18, "every certificate is an alarm again: {f:?}");
     }
 }
