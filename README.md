@@ -1,7 +1,8 @@
 # chouf
 
 *chouf* (« look » in Darija) runs a program in a throwaway sandbox full of **bait secrets** and tells you, in plain words,
-what it really did: which secrets it went after, how it will start again by itself, what it now trusts.
+what it really did: which secrets it went after and which process read them, **proof** of what left the machine, where it
+connected, how it will start again by itself. Your local network stays out of its reach.
 
 ![chouf catching a fake theme installer that sends the AWS keys and the SSH key to example.com](docs/demo.gif)
 
