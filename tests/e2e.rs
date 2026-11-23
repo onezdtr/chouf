@@ -186,3 +186,23 @@ fn the_local_network_is_out_of_reach() {
     assert!(j["activity"]["blocked"].as_array().unwrap().is_empty(), "{text}");
 }
 
+
+/// What a program set up to come back is set off once: a cron job and a .bashrc line that steal later are caught.
+#[test]
+#[ignore]
+fn a_patient_thief_is_caught_by_setting_off_what_it_left() {
+    let script = "mkdir -p /usr/local/lib/fs && printf '#!/bin/sh\\ncat ~/.aws/credentials >/dev/null\\n' > /usr/local/lib/fs/sync \
+                  && chmod +x /usr/local/lib/fs/sync && echo '17 * * * * root /usr/local/lib/fs/sync' > /etc/cron.d/fs \
+                  && echo 'cat ~/.ssh/id_ed25519 >/dev/null 2>&1' >> ~/.bashrc";
+    let (code, text, j) = chouf(&["run", "--no-net", "--", "sh", "-c", script]);
+    assert_eq!(code, 1, "{text}");
+    let triggered: Vec<&str> = j["triggered"].as_array().unwrap().iter().map(|t| t["did"].as_str().unwrap()).collect();
+    assert!(triggered.iter().any(|t| t.contains("bash -i -c true")), "{text}");
+    assert!(triggered.iter().any(|t| t.contains("sh -c /usr/local/lib/fs/sync")), "{text}");
+    assert!(has(&j, "secret", "~/.aws/credentials") && has(&j, "secret", "~/.ssh/id_ed25519"), "{text}");
+    if std::path::Path::new("/run/chouf-trace.sock").exists() {
+        let f = j["findings"].as_array().unwrap().iter().find(|f| f["path"] == "~/.aws/credentials").unwrap();
+        assert_eq!(f["by"][0], "cat /root/.aws/credentials", "{text}");
+        assert!(!text.contains("head -c 65536"), "chouf's own reads stay out:\n{text}");
+    }
+}
