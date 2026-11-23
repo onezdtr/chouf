@@ -1,0 +1,18 @@
+[package]
+name = "chouf-trace"
+version = "0.1.0"
+edition = "2021"
+description = "Root helper for chouf: traces what the processes of one sandbox do (exec, files, connections, DNS)"
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "1.0.104"
+libbpf-rs = "0.27.2"
+libc = "0.2.191"
+serde_json = "1"
+
+[features]
+static = ["libbpf-rs/static", "libbpf-rs/vendored"]
+
+[build-dependencies]
+libbpf-cargo = "0.27.2"
