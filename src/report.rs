@@ -500,7 +500,17 @@ impl Report<'_> {
             "exit_code": o.exit, "timed_out": o.timed_out, "seconds": o.elapsed.as_secs_f64(),
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
             "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by, "group": f.group, "count": f.count})).collect::<Vec<_>>(),
-            "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
+            "activity": match &self.activity {
+                Ok(a) => {
+                    let mut v = a.json();
+                    // name the bait each leak carried (the activity alone does not know the baits)
+                    for (i, l) in a.leaks.iter().enumerate() {
+                        v["leaks"][i]["what"] = leaked(self.canaries, l).map(|c| c.what).into();
+                    }
+                    v
+                }
+                Err(why) => json!({"unavailable": why}),
+            },
             "triggered": self.triggered.iter().map(|d| json!({"did": describe_short(d), "exit": d.exit, "timed_out": d.timed_out})).collect::<Vec<_>>(),
             "exploration": self.exploration.as_ref().map(|x| json!({
                 "model": x.model, "note": x.note,

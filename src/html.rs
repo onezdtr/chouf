@@ -119,7 +119,7 @@ pub fn page(r: &Value, in_short: &str) -> String {
         h += &format!("<section><h2>{}</h2>", t("What left the machine"));
         for l in leaks.iter().take(20) {
             let dest = l["name"].as_str().map(esc).unwrap_or_else(|| text(&l["ip"]));
-            h += &format!("<div class=\"f\"><span class=\"bad\">{} → {dest} (port {})</span><div class=\"by mono\">{} {}</div><div class=\"by mono\">&ldquo;{}&rdquo;</div></div>", t("one of your secrets"), l["port"], t("by"), text(&l["by"]), text(&l["excerpt"]));
+            h += &format!("<div class=\"f\"><span class=\"bad\">{} → {dest} (port {})</span><div class=\"by mono\">{} {}</div><div class=\"by mono\">&ldquo;{}&rdquo;</div></div>", l["what"].as_str().map(|w| esc(&t(w))).unwrap_or_else(|| t("one of your secrets")), l["port"], t("by"), text(&l["by"]), text(&l["excerpt"]));
         }
         h += "</section>";
     }
