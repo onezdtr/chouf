@@ -2,6 +2,7 @@
 
 use crate::canary::Canary;
 use crate::sandbox::{FsDiff, Outcome};
+use crate::explore::{describe_short, Done, Verdict};
 use crate::trace::Activity;
 use crate::watch::{Op, Touches};
 use serde_json::{json, Value};
@@ -214,6 +215,14 @@ fn quote(a: &str) -> String {
     }
 }
 
+/// What the explorer did and what it concluded: an opinion, printed next to the measured findings.
+pub struct Exploration<'a> {
+    pub steps: &'a [Done],
+    pub verdict: Result<Verdict, String>,
+    pub model: String,
+    pub note: Option<String>,
+}
+
 pub struct Report<'a> {
     pub id: &'a str,
     pub image: &'a str,
@@ -224,6 +233,7 @@ pub struct Report<'a> {
     pub transient: usize,
     /// What the kernel tracer saw, or why there is nothing.
     pub activity: Result<&'a Activity, String>,
+    pub exploration: Option<Exploration<'a>>,
 }
 
 impl Report<'_> {
@@ -235,6 +245,15 @@ impl Report<'_> {
             "watch_incomplete": self.incomplete, "temporary_files": self.transient,
             "findings": self.findings.iter().map(|f| json!({"kind": f.kind.tag(), "path": f.path, "did": f.did, "why": f.why, "by": f.by})).collect::<Vec<_>>(),
             "activity": match &self.activity { Ok(a) => a.json(), Err(why) => json!({"unavailable": why}) },
+            "exploration": self.exploration.as_ref().map(|x| json!({
+                "model": x.model, "note": x.note,
+                "steps": x.steps.iter().map(|d| json!({"did": describe_short(d), "exit": d.exit, "timed_out": d.timed_out})).collect::<Vec<_>>(),
+                "verdict": match &x.verdict {
+                    Ok(v) => json!({"level": v.level, "summary": v.summary,
+                        "points": v.points.iter().map(|p| json!({"says": p.says, "does": p.does, "assessment": p.assessment})).collect::<Vec<_>>()}),
+                    Err(e) => json!({"unavailable": e}),
+                },
+            })),
         })
     }
 
@@ -257,6 +276,15 @@ impl Report<'_> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        if let Some(x) = &self.exploration {
+            s += "\nHow chouf explored it\n";
+            for (i, d) in x.steps.iter().enumerate() {
+                s += &format!("   [{}] {}\n", i + 1, describe_short(d));
+            }
+            if let Some(n) = &x.note {
+                s += &format!("   ({n})\n");
+            }
+        }
         if self.findings.is_empty() {
             s += "\nNothing: no bait touched, no file changed.\n";
         }
@@ -314,6 +342,28 @@ impl Report<'_> {
                 }
             }
             Err(why) => s += &format!("\n({why})\n"),
+        }
+        if let Some(x) = &self.exploration {
+            s += &format!("\nWhat it says vs what it does  (opinion of {}, not a measurement)\n", x.model);
+            match &x.verdict {
+                Ok(v) => {
+                    let mark = match v.level.as_str() {
+                        "consistent" => "consistent: it does what it says",
+                        "suspicious" => "SUSPICIOUS: it does things it does not explain",
+                        _ => "MALICIOUS: it steals, hides or contradicts itself",
+                    };
+                    s += &format!("   {mark}\n   {}\n", v.summary);
+                    for p in &v.points {
+                        let sign = match p.assessment.as_str() {
+                            "consistent" => "ok",
+                            "contradicts" => "!!",
+                            _ => " ?",
+                        };
+                        s += &format!("   {sign} says: {}\n      does: {}\n", p.says, p.does);
+                    }
+                }
+                Err(e) => s += &format!("   ({e})\n"),
+            }
         }
         if self.transient > 0 {
             s += &format!(

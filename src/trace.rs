@@ -10,6 +10,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -40,7 +41,8 @@ pub fn cgroup_of(container: &str) -> io::Result<PathBuf> {
 
 pub struct Tracer {
     stream: UnixStream,
-    reader: thread::JoinHandle<(Vec<Value>, bool)>,
+    seen: Arc<Mutex<(Vec<Value>, bool)>>,
+    reader: thread::JoinHandle<()>,
 }
 
 impl Tracer {
@@ -60,28 +62,35 @@ impl Tracer {
         if let Some(e) = hello.get("error").and_then(Value::as_str) {
             return Err(io::Error::other(format!("chouf-trace: {e}")));
         }
+        let seen: Arc<Mutex<(Vec<Value>, bool)>> = Arc::default();
+        let s2 = seen.clone();
         let reader = thread::spawn(move || {
-            let (mut events, mut lost) = (Vec::new(), false);
             for line in r.lines().map_while(Result::ok) {
-                if events.len() >= MAX_EVENTS {
-                    lost = true;
-                    continue;
-                }
-                if let Ok(v) = serde_json::from_str(&line) {
-                    events.push(v);
+                let mut s = s2.lock().unwrap();
+                if s.0.len() >= MAX_EVENTS {
+                    s.1 = true;
+                } else if let Ok(v) = serde_json::from_str(&line) {
+                    s.0.push(v);
                 }
             }
-            (events, lost)
         });
-        Ok(Some(Tracer { stream, reader }))
+        Ok(Some(Tracer { stream, seen, reader }))
     }
 
-    /// Ends the watch and returns everything seen. The short wait lets the last events of the run reach us.
+    /// What was seen so far, the watch going on (the short wait lets the latest events reach us).
+    pub fn snapshot(&self) -> Activity {
+        thread::sleep(Duration::from_millis(600));
+        let s = self.seen.lock().unwrap();
+        Activity::from_events(&s.0, s.1)
+    }
+
+    /// Ends the watch and returns everything seen.
     pub fn stop(self) -> Activity {
         thread::sleep(Duration::from_millis(600));
         let _ = self.stream.shutdown(Shutdown::Write); // the service ends the watch and closes its side
-        let (events, lost) = self.reader.join().unwrap_or_default();
-        Activity::from_events(&events, lost)
+        let _ = self.reader.join();
+        let s = self.seen.lock().unwrap();
+        Activity::from_events(&s.0, s.1)
     }
 }
 
@@ -246,7 +255,9 @@ impl Activity {
         // only processes that ran a program are shown; forked subshells pass their children up
         let mut kids: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut roots = Vec::new();
-        for (pid, p) in self.procs.iter().filter(|(_, p)| !p.execs.is_empty()) {
+        // chouf's own keep-alive process (explore) is not the program's
+        let ours = |p: &Proc| p.execs.len() == 1 && p.execs[0].args == ["sleep", "infinity"] && !self.procs.contains_key(&p.ppid);
+        for (pid, _) in self.procs.iter().filter(|(_, p)| !p.execs.is_empty() && !ours(p)) {
             match self.shown_parent(*pid).filter(|pp| pp != pid) {
                 Some(pp) => kids.entry(pp).or_default().push(*pid),
                 None => roots.push(*pid),

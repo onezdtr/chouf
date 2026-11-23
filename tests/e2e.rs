@@ -131,3 +131,37 @@ fn without_the_tracer_the_report_says_so() {
     let (_, text, j) = chouf_env(&["run", "--no-net", "--", "true"], &[("CHOUF_TRACE_SOCK", "/nonexistent/chouf-trace.sock")]);
     assert!(j["activity"]["unavailable"].as_str().unwrap().contains("chouf-trace"), "{text}");
 }
+
+/// The explorer's loop end to end, with a scripted model: no network, no key, same answers every time.
+#[test]
+#[ignore]
+fn the_explorer_types_answers_waits_and_reports_its_verdict() {
+    let dir = std::env::temp_dir().join(format!("chouf-explore-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "case \"$1\" in\n  ask) printf 'Continue? [y/N] '; read a; [ \"$a\" = y ] && cat ~/.aws/credentials > /dev/null && echo yes;;\n  *) echo 'usage: tool ask';;\nesac\n").unwrap();
+    let script = dir.join("answers.jsonl");
+    std::fs::write(&script, [
+        r#"{"action":"run","argv":["sh","/input/tool","ask"],"stdin":"y\n","why":"answer the prompt"}"#,
+        r#"{"action":"wait","seconds":1,"why":"anything later?"}"#,
+        r#"{"action":"stop","why":"seen enough"}"#,
+        r#"{"level":"suspicious","summary":"It reads AWS keys after a yes.","points":[{"says":"asks to continue","does":"reads ~/.aws/credentials","assessment":"unexplained"}]}"#,
+    ].join("\n")).unwrap();
+    let (code, text, j) = chouf_env(
+        &["explore", "--no-net", "--file", tool.to_str().unwrap(), "--", "sh", "/input/tool"],
+        &[("CHOUF_FAKE_LLM", script.to_str().unwrap())],
+    );
+    assert_eq!(code, 1, "{text}");
+    let steps: Vec<&str> = j["exploration"]["steps"].as_array().unwrap().iter().map(|s| s["did"].as_str().unwrap()).collect();
+    assert_eq!(steps.len(), 3, "{text}");
+    assert!(steps[1].starts_with("$ sh /input/tool ask  (typed \"y\\n\") · exit 0"), "{text}");
+    assert!(steps[2].starts_with("waited 1 s"), "{text}");
+    assert!(has(&j, "secret", "~/.aws/credentials"), "the typed answer reached the program:\n{text}");
+    assert_eq!(j["exploration"]["verdict"]["level"], "suspicious");
+    assert!(text.contains("SUSPICIOUS"), "{text}");
+    // the program's output reached the model fenced as untrusted
+    let prompts = std::fs::read_to_string(script.with_extension("prompts")).unwrap();
+    assert!(prompts.contains("<<<UNTRUSTED\nusage: tool ask"), "{prompts}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+

