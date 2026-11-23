@@ -13,6 +13,9 @@ const EV_UDP: u8 = 4;
 const EV_EXIT: u8 = 5;
 const EV_FORK: u8 = 6;
 const EV_BLOCKED: u8 = 7;
+const EV_SENT: u8 = 8;
+const EV_CLOSE: u8 = 9;
+const SAMPLE: usize = 512;
 const AF_INET: u16 = 2;
 const O_ACCMODE: u32 = 3;
 const O_CREAT: u32 = 0o100;
@@ -41,6 +44,40 @@ fn ip(family: u16, a: &[u8]) -> IpAddr {
     } else {
         IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(a).unwrap()))
     }
+}
+
+/// A data sample (EV_SENT): its watched cgroup, where it went as JSON, and the bytes (only the valid ones).
+pub fn sent(b: &[u8], boot_ms: i64) -> Option<(u64, Value, &[u8])> {
+    if b.len() != SIZE || b[36] != EV_SENT {
+        return None;
+    }
+    let family = u16_at(b, 32);
+    let n = (u32_at(b, 28) as usize).min(SAMPLE);
+    let v = json!({
+        "t": boot_ms + (u64_at(b, 0) / 1_000_000) as i64,
+        "pid": u32_at(b, 16),
+        "comm": cstr(&b[56..72]),
+        "ip": ip(family, &b[40..if family == AF_INET { 44 } else { 56 }]).to_string(),
+        "port": u16_at(b, 34),
+    });
+    Some((u64_at(b, 8), v, &b[72..72 + n]))
+}
+
+/// Where each pattern occurs in a sample, with a short readable excerpt around it (non-printable bytes as '.').
+pub fn find(sample: &[u8], patterns: &[Vec<u8>]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
+        if p.is_empty() || p.len() > sample.len() {
+            continue;
+        }
+        if let Some(at) = sample.windows(p.len()).position(|w| w == p.as_slice()) {
+            let lo = at.saturating_sub(40);
+            let hi = (at + p.len() + 40).min(sample.len());
+            let excerpt: String = sample[lo..hi].iter().map(|&c| if (0x20..0x7f).contains(&c) { c as char } else { '.' }).collect();
+            out.push((i, excerpt));
+        }
+    }
+    out
 }
 
 /// (watched cgroup, event as JSON), or None for a sample that is not a known event.
@@ -84,6 +121,14 @@ pub fn decode(b: &[u8], boot_ms: i64) -> Option<(u64, Value)> {
             o.insert("create".into(), (flags & O_CREAT != 0).into());
             o.insert("truncate".into(), (flags & O_TRUNC != 0).into());
             o.insert("directory".into(), (flags & O_DIRECTORY != 0).into());
+        }
+        EV_CLOSE => {
+            let family = u16_at(b, 32);
+            o.insert("kind".into(), "close".into());
+            o.insert("ip".into(), ip(family, &b[40..if family == AF_INET { 44 } else { 56 }]).to_string().into());
+            o.insert("port".into(), u16_at(b, 34).into());
+            o.insert("sent".into(), u64_at(b, 72).into());
+            o.insert("received".into(), u64_at(b, 80).into());
         }
         EV_BLOCKED => {
             let family = u16_at(b, 32);
@@ -160,4 +205,21 @@ mod tests {
         assert!(decode(&raw(99, 0, b"\0", b""), 0).is_none());
         assert!(decode(&b[..100], 0).is_none());
     }
+
+    #[test]
+    fn leaks_are_found_with_an_excerpt_and_samples_never_read_past_their_length() {
+        let mut b = raw(EV_SENT, 20, b"", b"");
+        b[72..92].copy_from_slice(b"POST /x key=ab12cd!!");
+        b[92..120].copy_from_slice(b"ab12cd-should-not-be-seen-xx"); // stale bytes past the length
+        let (cg, v, data) = sent(&b, 0).unwrap();
+        assert_eq!((cg, data.len(), v["pid"].as_u64()), (42, 20, Some(7)));
+        let pats = vec![b"ab12cd".to_vec(), b"zz".to_vec(), b"should".to_vec()];
+        let found = find(data, &pats);
+        assert_eq!(found, vec![(0, "POST /x key=ab12cd!!".to_string())]);
+        let mut c = raw(EV_CLOSE, 0, b"", b"");
+        c[72..80].copy_from_slice(&3000u64.to_ne_bytes());
+        let (_, v) = decode(&c, 0).unwrap();
+        assert_eq!((v["kind"].as_str(), v["sent"].as_u64()), (Some("close"), Some(3000)));
+    }
 }
+

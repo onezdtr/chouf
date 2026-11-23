@@ -74,12 +74,14 @@ pub fn allowed(path: &str, uid: u32) -> Result<(PathBuf, u64)> {
 }
 
 enum Cmd {
-    Watch { id: u64, uid: u32, dir: fs::File, guard: bool, tx: SyncSender<Value>, reply: Sender<Result<(), String>> },
+    Watch { id: u64, uid: u32, dir: fs::File, guard: bool, find: Vec<Vec<u8>>, tx: SyncSender<Value>, reply: Sender<Result<(), String>> },
     Unwatch { id: u64 },
 }
 
 struct Watch {
     uid: u32,
+    /// Byte strings to look for in what the sandbox sends (the session's bait marks): only matches are reported.
+    find: Vec<Vec<u8>>,
     tx: SyncSender<Value>,
     _links: Vec<Link>,
 }
@@ -115,6 +117,16 @@ fn client(stream: UnixStream, cmds: Sender<Cmd>) -> Result<()> {
     let mut out = stream.try_clone()?;
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
     let guard = req.get("guard").and_then(Value::as_bool).unwrap_or(false);
+    let find: Vec<Vec<u8>> = req
+        .get("find")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|p| (8..=64).contains(&p.len()))
+        .take(16)
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
     let Some(path) = req.get("watch").and_then(Value::as_str) else {
         writeln!(out, "{}", json!({"error": "expected {\"watch\": \"/sys/fs/cgroup/...\"}"}))?;
         return Ok(());
@@ -128,7 +140,7 @@ fn client(stream: UnixStream, cmds: Sender<Cmd>) -> Result<()> {
     };
     let (tx, rx): (SyncSender<Value>, Receiver<Value>) = mpsc::sync_channel(QUEUE);
     let (rtx, rrx) = mpsc::channel();
-    cmds.send(Cmd::Watch { id, uid, dir: fs::File::open(&p)?, guard, tx, reply: rtx })?;
+    cmds.send(Cmd::Watch { id, uid, dir: fs::File::open(&p)?, guard, find, tx, reply: rtx })?;
     if let Err(e) = rrx.recv()? {
         writeln!(out, "{}", json!({"error": e}))?;
         return Ok(());
@@ -191,6 +203,18 @@ fn main() -> Result<()> {
     let w2 = watches.clone();
     let mut rb = RingBufferBuilder::new();
     rb.add(&skel.maps.events, move |data| {
+        if let Some((cg, mut v, sample)) = event::sent(data, boot) {
+            // data the sandbox sends: only what matches its owner's patterns leaves the daemon
+            if let Some(w) = w2.lock().unwrap().get(&cg) {
+                for (i, excerpt) in event::find(sample, &w.find) {
+                    v["kind"] = "leak".into();
+                    v["pattern"] = i.into();
+                    v["excerpt"] = excerpt.into();
+                    let _ = w.tx.try_send(v.clone());
+                }
+            }
+            return 0;
+        }
         let routed = if data.len() == event::SIZE {
             event::decode(data, boot)
         } else {
@@ -235,7 +259,7 @@ fn main() -> Result<()> {
         while let Ok(cmd) = crx.try_recv() {
             let mut ws = watches.lock().unwrap();
             match cmd {
-                Cmd::Watch { id, uid, dir, guard, tx, reply } => {
+                Cmd::Watch { id, uid, dir, guard, find, tx, reply } => {
                     let res = if ws.contains_key(&id) {
                         Err("this cgroup is already watched".to_string())
                     } else if ws.values().filter(|w| w.uid == uid).count() >= MAX_WATCHES_PER_UID {
@@ -268,7 +292,7 @@ fn main() -> Result<()> {
                         res
                     };
                     if res.is_ok() {
-                        ws.insert(id, Watch { uid, tx, _links: links });
+                        ws.insert(id, Watch { uid, find, tx, _links: links });
                         bss.watching = ws.len() as u32;
                     } else {
                         let _ = skel.maps.watched.delete(&id.to_ne_bytes());

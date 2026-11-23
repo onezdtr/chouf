@@ -13,6 +13,8 @@ pub struct Canary {
     pub what: &'static str,
     /// The family it belongs to, in words anyone understands: "passwords", "crypto wallets"...
     pub group: &'static str,
+    /// Its own mark: the session token and two hex digits, found in its content (as is, or upper case).
+    pub mark: String,
 }
 
 pub const PASSWORDS: &str = "passwords and browser logins";
@@ -136,6 +138,33 @@ pub fn planted(rel: &str) -> Option<&'static str> {
     PLAIN.iter().find(|(p, _)| *p == rel).map(|(_, body)| *body)
 }
 
+fn base64(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    b.chunks(3)
+        .flat_map(|c| {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            (0..c.len() + 1).map(move |i| A[(n >> (18 - 6 * i) & 63) as usize] as char)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub fn tests_base64(b: &[u8]) -> String {
+    base64(b)
+}
+
+/// What to look for in the data a sandbox sends: the session token as written, in upper case (AWS key ids), and
+/// base64-encoded at each of the three alignments it can fall on (base64 is how stolen files usually travel).
+pub fn leak_patterns(token: &str) -> Vec<String> {
+    let t = token.as_bytes();
+    let mut out = vec![token.to_string(), token.to_uppercase()];
+    for skip in 0..3 {
+        let whole = (t.len() - skip) / 3 * 3;
+        out.push(base64(&t[skip..skip + whole]));
+    }
+    out
+}
+
 /// Writes the fake home and returns the bait list.
 pub fn plant(home: &Path, token: &str) -> io::Result<Vec<Canary>> {
     let write = |rel: &str, body: &[u8], mode: u32| -> io::Result<()> {
@@ -148,13 +177,12 @@ pub fn plant(home: &Path, token: &str) -> io::Result<Vec<Canary>> {
         write(rel, body.as_bytes(), 0o644)?;
     }
     let mut out = Vec::new();
-    for (rel, what, group, body) in baits(token) {
+    // each bait gets its own mark (token + its index), so a leak says which secret left
+    for i in 0..baits(token).len() {
+        let mark = format!("{token}{i:02x}");
+        let (rel, what, group, body) = baits(&mark).into_iter().nth(i).unwrap();
         write(rel, body.as_bytes(), 0o600)?;
-        out.push(Canary {
-            path: rel.to_string(),
-            what,
-            group,
-        });
+        out.push(Canary { path: rel.to_string(), what, group, mark });
     }
     fs::set_permissions(home.join(".ssh"), fs::Permissions::from_mode(0o700))?;
     Ok(out)
@@ -182,8 +210,11 @@ mod tests {
         for c in &baits {
             let body = fs::read(dir.join(&c.path)).unwrap();
             let s = String::from_utf8_lossy(&body).to_lowercase();
-            assert!(s.contains(&t), "{} lacks the token", c.path);
+            assert!(s.contains(&c.mark) && c.mark.starts_with(&t), "{} lacks its own mark", c.path);
         }
+        let mut marks: Vec<&str> = baits.iter().map(|c| c.mark.as_str()).collect();
+        marks.dedup();
+        assert_eq!(marks.len(), baits.len());
         assert_eq!(
             fs::metadata(dir.join(".ssh/id_ed25519"))
                 .unwrap()
@@ -194,4 +225,18 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn leak_patterns_find_the_token_however_it_is_base64_aligned() {
+        let t = "0123456789abcdef";
+        let p = leak_patterns(t);
+        assert_eq!(&p[..2], &[t.to_string(), t.to_uppercase()]);
+        for prefix in ["", "x", "xy"] {
+            let enc = base64(format!("{prefix}{t}--").as_bytes());
+            assert!(p[2..].iter().any(|pat| enc.contains(pat.as_str())), "alignment {prefix:?} missed in {enc}");
+        }
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert!(p.iter().all(|x| (8..=64).contains(&x.len())));
+    }
 }
+

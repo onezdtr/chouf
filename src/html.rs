@@ -112,6 +112,14 @@ pub fn page(r: &Value, in_short: &str) -> String {
     }
 
     let a = &r["activity"];
+    if let Some(leaks) = a["leaks"].as_array().filter(|l| !l.is_empty()) {
+        h += "<section><h2>What left the machine</h2>";
+        for l in leaks.iter().take(20) {
+            let dest = l["name"].as_str().map(esc).unwrap_or_else(|| text(&l["ip"]));
+            h += &format!("<div class=\"f\"><span class=\"bad\">bait data sent to {dest} (port {})</span><div class=\"by mono\">by {}</div><div class=\"by mono\">&ldquo;{}&rdquo;</div></div>", l["port"], text(&l["by"]), text(&l["excerpt"]));
+        }
+        h += "</section>";
+    }
     if let Some(conns) = a["connections"].as_array().filter(|c| !c.is_empty()) {
         h += "<section><h2>Where it connected</h2>";
         for c in conns.iter().take(50) {
@@ -119,7 +127,9 @@ pub fn page(r: &Value, in_short: &str) -> String {
                 Some(n) => format!("{} ({})", esc(n), text(&c["ip"])),
                 None => text(&c["ip"]),
             };
-            h += &format!("<div class=\"f\"><span class=\"mono\">{dest} port {}</span><div class=\"by mono\">by {}</div></div>", c["port"], text(&c["by"]));
+            let sent = c["sent"].as_u64().unwrap_or(0);
+            let bytes = if sent > 0 { format!(" · sent {sent} bytes") } else { String::new() };
+            h += &format!("<div class=\"f\"><span class=\"mono\">{dest} port {}{bytes}</span><div class=\"by mono\">by {}</div></div>", c["port"], text(&c["by"]));
         }
         h += "</section>";
     }

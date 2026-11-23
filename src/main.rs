@@ -168,11 +168,11 @@ fn finish(s: &Session, r: &report::Report) -> io::Result<ExitCode> {
     let mut json = r.json();
     json["token"] = s.token.clone().into();
     fs::write(s.dir.join("report.json"), serde_json::to_vec_pretty(&json).map_err(io::Error::other)?)?;
-    let short = report::in_short(&r.findings, r.activity.as_ref().ok().copied());
+    let short = report::in_short(&r.findings, r.activity.as_ref().ok().copied(), r.canaries);
     fs::write(s.dir.join("report.html"), html::page(&json, &short))?;
     print!("{}", r.text());
     println!("\nsession: {}  (report.html to share)", s.dir.display());
-    let probed_lan = r.activity.as_ref().is_ok_and(|a| !a.blocked.is_empty());
+    let probed_lan = r.activity.as_ref().is_ok_and(|a| !a.blocked.is_empty() || !a.leaks.is_empty());
     let alarming = probed_lan || r.findings.iter().any(|f| f.kind != report::Kind::Other);
     Ok(if alarming { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
@@ -233,7 +233,7 @@ struct Machine<'a> {
 fn machine<'a>(o: &Opts, s: &Session, spec: &'a sandbox::Spec<'a>) -> io::Result<Machine<'a>> {
     let created = sandbox::create(spec)?;
     // before start: the container's cgroup exists from `podman init`, so the first instruction is seen
-    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan));
+    let tracer = tracer_result(trace::Tracer::start(&spec.name, o.net && !o.allow_lan, &canary::leak_patterns(&s.token)));
     let watcher = watch::Watcher::start(&s.home)?;
     let live = created.start_live()?;
     Ok(Machine { live, tracer, watcher })
@@ -292,6 +292,7 @@ fn conclude<'e>(
             transient: report::transient_count(&touches),
             incomplete: touches.incomplete,
             activity: activity.as_ref().map_err(Clone::clone),
+            canaries: &s.canaries,
             exploration,
             triggered,
         },

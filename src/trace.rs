@@ -48,14 +48,15 @@ pub struct Tracer {
 impl Tracer {
     /// Ok(None) when the service is not installed; Err when it refused.
     /// `guard`: the service refuses the sandbox's connections to the local network (DNS excepted) and reports them.
-    pub fn start(container: &str, guard: bool) -> io::Result<Option<Tracer>> {
+    /// `find`: byte strings the service looks for in what the sandbox sends (the bait marks); it reports only matches.
+    pub fn start(container: &str, guard: bool, find: &[String]) -> io::Result<Option<Tracer>> {
         let sock = std::env::var("CHOUF_TRACE_SOCK").unwrap_or_else(|_| SOCK.to_string());
         let Ok(stream) = UnixStream::connect(sock) else {
             return Ok(None);
         };
         let cg = cgroup_of(container)?;
         let mut w = stream.try_clone()?;
-        writeln!(w, "{}", json!({"watch": cg, "guard": guard}))?;
+        writeln!(w, "{}", json!({"watch": cg, "guard": guard, "find": find}))?;
         let mut r = BufReader::new(stream.try_clone()?);
         let mut first = String::new();
         r.read_line(&mut first)?;
@@ -126,6 +127,20 @@ pub struct Conn {
     pub ip: String,
     pub port: u64,
     pub name: Option<String>,
+    /// Bytes sent and received over it (TCP, counted when it closes).
+    pub sent: u64,
+    pub received: u64,
+}
+
+/// Bait data seen leaving the machine: which pattern matched, and the bytes around it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leak {
+    pub pid: u32,
+    pub ip: String,
+    pub port: u64,
+    pub name: Option<String>,
+    pub pattern: usize,
+    pub excerpt: String,
 }
 
 /// A connection to the local network that the guard refused.
@@ -143,6 +158,7 @@ pub struct Activity {
     pub opens: Vec<Open>,
     pub conns: Vec<Conn>,
     pub blocked: Vec<Blocked>,
+    pub leaks: Vec<Leak>,
     pub lost: bool,
 }
 
@@ -203,7 +219,29 @@ impl Activity {
                         continue; // a DNS question: its answer names the next connections instead
                     }
                     if seen_conns.insert((pid, ip.clone(), port, k)) {
-                        a.conns.push(Conn { pid, proto: if k == "connect" { "tcp" } else { "udp" }, name: names.get(&ip).cloned(), ip, port });
+                        a.conns.push(Conn { pid, proto: if k == "connect" { "tcp" } else { "udp" }, name: names.get(&ip).cloned(), ip, port, sent: 0, received: 0 });
+                    }
+                }
+                Some("close") => {
+                    let ip = e["ip"].as_str().unwrap_or("");
+                    let port = e["port"].as_u64().unwrap_or(0);
+                    if let Some(c) = a.conns.iter_mut().find(|c| c.pid == pid && c.ip == ip && c.port == port && c.proto == "tcp") {
+                        c.sent += e["sent"].as_u64().unwrap_or(0);
+                        c.received += e["received"].as_u64().unwrap_or(0);
+                    }
+                }
+                Some("leak") => {
+                    let ip = e["ip"].as_str().unwrap_or("").to_string();
+                    let l = Leak {
+                        pid,
+                        name: names.get(&ip).cloned(),
+                        ip,
+                        port: e["port"].as_u64().unwrap_or(0),
+                        pattern: e["pattern"].as_u64().unwrap_or(0) as usize,
+                        excerpt: e["excerpt"].as_str().unwrap_or("").into(),
+                    };
+                    if !a.leaks.iter().any(|x| x.pid == l.pid && x.ip == l.ip && x.excerpt == l.excerpt) {
+                        a.leaks.push(l);
                     }
                 }
                 Some("blocked") => {
@@ -247,6 +285,7 @@ impl Activity {
         self.opens.retain(|o| !hidden.contains(&o.pid));
         self.conns.retain(|c| !hidden.contains(&c.pid));
         self.blocked.retain(|b| !hidden.contains(&b.pid));
+        self.leaks.retain(|l| !hidden.contains(&l.pid));
         self
     }
 
@@ -356,7 +395,8 @@ impl Activity {
     pub fn json(&self) -> Value {
         json!({
             "programs": self.tree().iter().map(|(d, c, x)| json!({"depth": d, "command": c, "exit": x})).collect::<Vec<_>>(),
-            "connections": self.conns.iter().map(|c| json!({"by": self.who(c.pid, i64::MAX), "proto": c.proto, "ip": c.ip, "port": c.port, "name": c.name})).collect::<Vec<_>>(),
+            "connections": self.conns.iter().map(|c| json!({"by": self.who(c.pid, i64::MAX), "proto": c.proto, "ip": c.ip, "port": c.port, "name": c.name, "sent": c.sent, "received": c.received})).collect::<Vec<_>>(),
+            "leaks": self.leaks.iter().map(|l| json!({"by": self.who(l.pid, i64::MAX), "ip": l.ip, "port": l.port, "name": l.name, "excerpt": l.excerpt})).collect::<Vec<_>>(),
             "blocked": self.blocked.iter().map(|b| json!({"by": self.who(b.pid, i64::MAX), "ip": b.ip, "port": b.port, "proto": b.proto})).collect::<Vec<_>>(),
             "events_lost": self.lost,
         })

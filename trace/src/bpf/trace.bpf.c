@@ -22,7 +22,10 @@
 #define ARGS_LEN 256
 #define MAX_DEPTH 16
 
-enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5, EV_FORK = 6, EV_BLOCKED = 7 };
+enum kind { EV_EXEC = 1, EV_OPEN = 2, EV_CONNECT = 3, EV_UDP = 4, EV_EXIT = 5, EV_FORK = 6, EV_BLOCKED = 7,
+	     EV_SENT = 8, EV_CLOSE = 9 };
+#define ST_CLOSE 7
+#define SAMPLE 512
 
 // Shared with userspace (src/event.rs): 584 bytes, no implicit padding.
 struct event {
@@ -38,6 +41,7 @@ struct event {
 	u8 _pad[3];
 	u8 daddr[16];
 	char comm[16];
+	// sent: the first bytes of the data (SAMPLE, spilling into args; length in flags); close: u64 sent, u64 received
 	char path[PATH_LEN];   // exec: the file run; open: the file opened
 	char args[ARGS_LEN];   // exec: argv, NUL-separated
 };
@@ -69,6 +73,21 @@ struct udp_key {
 	u16 dport;
 	u8 daddr[16];
 };
+
+// Who opened each watched TCP connection: its CLOSE often runs in softirq context, where "current" is anyone.
+struct owner {
+	u64 cgroup;
+	u32 tgid;
+	u32 uid;
+	char comm[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, struct owner);
+} owners SEC(".maps");
 
 // First packet of each UDP flow only: enough to know where a sandboxed program sends data.
 struct {
@@ -245,6 +264,88 @@ int BPF_PROG(on_tcp_state, struct sock *sk, int oldstate, int newstate)
 	if (!e)
 		return 0;
 	sk_dest(sk, e);
+	struct owner o = { .cgroup = cg, .tgid = e->tgid, .uid = e->uid };
+	__builtin_memcpy(o.comm, e->comm, sizeof(o.comm));
+	u64 key = (u64)sk;
+	bpf_map_update_elem(&owners, &key, &o, BPF_ANY);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+// A watched connection ends: how much it carried (payload only, as 3assas counts it).
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(on_tcp_close, struct sock *sk, int oldstate, int newstate)
+{
+	if (newstate != ST_CLOSE || sk->sk_protocol != PROTO_TCP)
+		return 0;
+	u64 key = (u64)sk;
+	struct owner *o = bpf_map_lookup_elem(&owners, &key);
+	if (!o)
+		return 0;
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		count_drop();
+		bpf_map_delete_elem(&owners, &key);
+		return 0;
+	}
+	__builtin_memset(e, 0, offsetof(struct event, path));
+	e->ts_ns = bpf_ktime_get_ns();
+	e->cgroup = o->cgroup;
+	e->kind = EV_CLOSE;
+	e->tgid = o->tgid;
+	e->uid = o->uid;
+	__builtin_memcpy(e->comm, o->comm, sizeof(e->comm));
+	sk_dest(sk, e);
+	u64 sent = 0, recv = 0;
+	struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+	if (tp) {
+		sent = tp->bytes_sent - tp->bytes_retrans;
+		recv = tp->bytes_received;
+	}
+	__builtin_memcpy(e->path, &sent, 8);
+	__builtin_memcpy(e->path + 8, &recv, 8);
+	bpf_ringbuf_submit(e, 0);
+	bpf_map_delete_elem(&owners, &key);
+	return 0;
+}
+
+// The first SAMPLE bytes of what a watched program sends: the daemon looks for the session's bait marks in them and
+// forwards only the matches, never the data.
+static __always_inline void sample(struct msghdr *msg, struct event *e)
+{
+	u8 type = BPF_CORE_READ(msg, msg_iter.iter_type);
+	void *ptr = 0;
+	u64 len = 0;
+	if (type == ITER_UBUF) {
+		ptr = BPF_CORE_READ(msg, msg_iter.ubuf);
+		len = BPF_CORE_READ(msg, msg_iter.count);
+	} else if (type == ITER_IOVEC) {
+		const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+		u64 off = BPF_CORE_READ(msg, msg_iter.iov_offset);
+		ptr = (char *)BPF_CORE_READ(iov, iov_base) + off;
+		len = BPF_CORE_READ(iov, iov_len) - off;
+	}
+	u32 n = len > SAMPLE ? SAMPLE : len;
+	barrier_var(n);
+	if (ptr && n > 0 && n <= SAMPLE && !bpf_probe_read_user(e->path, n, ptr))
+		e->flags = n;
+}
+
+SEC("fentry/tcp_sendmsg")
+int BPF_PROG(on_tcp_send, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	u64 cg = watched_cgroup();
+	if (!cg)
+		return 0;
+	struct event *e = reserve(EV_SENT, cg);
+	if (!e)
+		return 0;
+	sk_dest(sk, e);
+	sample(msg, e);
+	if (!e->flags) {
+		bpf_ringbuf_discard(e, 0);
+		return 0;
+	}
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -277,6 +378,17 @@ static __always_inline int udp_send(struct sock *sk, struct msghdr *msg, u16 fam
 			bpf_probe_read_kernel(k.daddr, 16, &sk->__sk_common.skc_v6_daddr);
 	}
 	k.tgid = bpf_get_current_pid_tgid() >> 32;
+	struct event *s = reserve(EV_SENT, cg);
+	if (s) {
+		s->family = family;
+		s->dport = k.dport;
+		__builtin_memcpy(s->daddr, k.daddr, 16);
+		sample(msg, s);
+		if (s->flags)
+			bpf_ringbuf_submit(s, 0);
+		else
+			bpf_ringbuf_discard(s, 0);
+	}
 	u8 one = 1;
 	if (bpf_map_update_elem(&udp_seen, &k, &one, BPF_NOEXIST)) // already reported
 		return 0;

@@ -3,7 +3,7 @@
 use crate::canary::Canary;
 use crate::sandbox::{FsDiff, Outcome};
 use crate::explore::{describe_short, Done, Verdict};
-use crate::trace::Activity;
+use crate::trace::{Activity, Leak};
 use crate::watch::{Op, Touches};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -268,7 +268,48 @@ fn advice(group: &str) -> &'static str {
 }
 
 /// The report's first lines, for anyone: computed from the measured findings, never from the model.
-pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
+fn unbase64(s: &str) -> Vec<u8> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    };
+    let v: Vec<u8> = s.bytes().filter_map(val).collect();
+    v.chunks(4)
+        .flat_map(|c| {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, &x)| n | (x as u32) << (18 - 6 * i));
+            (0..c.len().saturating_sub(1)).map(move |i| (n >> (16 - 8 * i)) as u8)
+        })
+        .collect()
+}
+
+/// Which bait a leak carried: its mark in the excerpt as is, in upper case, or inside a base64 run (decoded at each
+/// of the four offsets a run can start on). None: some bait data left, which one is not readable.
+pub fn leaked<'c>(canaries: &'c [Canary], l: &Leak) -> Option<&'c Canary> {
+    let up = l.excerpt.to_uppercase();
+    if let Some(c) = canaries.iter().find(|c| l.excerpt.contains(&c.mark) || up.contains(&c.mark.to_uppercase())) {
+        return Some(c);
+    }
+    let runs = l.excerpt.split(|ch: char| !(ch.is_ascii_alphanumeric() || "+/-_".contains(ch)));
+    for run in runs.filter(|r| r.len() >= 16) {
+        for off in 0..4 {
+            let text = String::from_utf8_lossy(&unbase64(&run[off.min(run.len())..])).to_lowercase();
+            if let Some(c) = canaries.iter().find(|c| text.contains(&c.mark)) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn kb(n: u64) -> String {
+    if n < 1024 { format!("{n} bytes") } else if n < 1 << 20 { format!("{:.1} KB", n as f64 / 1024.0) } else { format!("{:.1} MB", n as f64 / 1048576.0) }
+}
+
+pub fn in_short(findings: &[Finding], activity: Option<&Activity>, canaries: &[Canary]) -> String {
     let secrets: Vec<&Finding> = findings.iter().filter(|f| f.kind == Kind::Secret).collect();
     let persist = findings.iter().filter(|f| f.kind == Kind::Persistence).count();
     let trust = findings.iter().filter(|f| f.kind == Kind::Trust).count();
@@ -277,7 +318,19 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
     groups.dedup();
     let mut s = String::from("\nIn short\n");
     let probed = activity.is_some_and(|a| !a.blocked.is_empty());
-    if secrets.is_empty() && persist == 0 && trust == 0 && !probed {
+    let leaks = activity.map(|a| a.leaks.as_slice()).unwrap_or(&[]);
+    let mut proofs: Vec<(String, String)> = Vec::new();
+    for l in leaks {
+        let what = leaked(canaries, l).map(|c| format!("your {}", c.what)).unwrap_or_else(|| "one of your secrets".into());
+        let dest = l.name.clone().unwrap_or_else(|| l.ip.clone());
+        if !proofs.contains(&(what.clone(), dest.clone())) {
+            proofs.push((what, dest));
+        }
+    }
+    for (what, dest) in proofs.iter().take(5) {
+        s += &format!("   !! PROOF: {what} left the machine, sent to {dest}.\n");
+    }
+    if secrets.is_empty() && persist == 0 && trust == 0 && !probed && leaks.is_empty() {
         s += "   Nothing alarming: no secret touched, nothing set to run again, nothing new trusted.\n";
     }
     if !secrets.is_empty() {
@@ -301,6 +354,21 @@ pub fn in_short(findings: &[Finding], activity: Option<&Activity>) -> String {
         tries.dedup();
         s += &format!("   !! It tried to reach your local network {} time{} (router, other machines): chouf refused. {}\n",
             a.blocked.len(), if a.blocked.len() > 1 { "s" } else { "" }, tries.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+    }
+    // read secrets, then sent data out: the content may be encrypted (HTTPS), the sequence still says something
+    if let (Some(a), false, true) = (activity, leaks.is_empty() == false, !secrets.is_empty()) {
+        let mut out: Vec<(String, u64)> = Vec::new();
+        for c in a.conns.iter().filter(|c| c.sent > 0) {
+            let dest = c.name.clone().unwrap_or_else(|| c.ip.clone());
+            match out.iter_mut().find(|(d, _)| *d == dest) {
+                Some(x) => x.1 += c.sent,
+                None => out.push((dest, c.sent)),
+            }
+        }
+        if !out.is_empty() {
+            let list: Vec<String> = out.iter().take(3).map(|(d, n)| format!("{} to {d}", kb(*n))).collect();
+            s += &format!("   !! After reading your secrets it sent {}.\n", list.join(", "));
+        }
     }
     if let Some(a) = activity {
         let mut places: Vec<String> = a.conns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.ip.clone())).collect();
@@ -404,6 +472,7 @@ pub struct Report<'a> {
     pub transient: usize,
     /// What the kernel tracer saw, or why there is nothing.
     pub activity: Result<&'a Activity, String>,
+    pub canaries: &'a [Canary],
     pub exploration: Option<Exploration<'a>>,
     /// What the program set up to come back, set off once by chouf (persist.rs).
     pub triggered: &'a [Done],
@@ -450,7 +519,7 @@ impl Report<'_> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        s += &in_short(&self.findings, self.activity.as_ref().ok().copied());
+        s += &in_short(&self.findings, self.activity.as_ref().ok().copied(), self.canaries);
         if let Some(x) = &self.exploration {
             s += "\nHow chouf explored it\n";
             for (i, d) in x.steps.iter().enumerate() {
@@ -515,6 +584,14 @@ impl Report<'_> {
                         s += &format!("   and {} more\n", a.blocked.len() - 20);
                     }
                 }
+                if !a.leaks.is_empty() {
+                    s += "\nWhat left the machine (bait data seen in what it sent)\n";
+                    for l in a.leaks.iter().take(10) {
+                        let what = leaked(self.canaries, l).map(|c| c.what.to_string()).unwrap_or_else(|| "bait data".into());
+                        let dest = l.name.clone().unwrap_or_else(|| l.ip.clone());
+                        s += &format!(" ! {what} → {dest} port {}  by {}\n      \"{}\"\n", l.port, a.who(l.pid, i64::MAX), l.excerpt);
+                    }
+                }
                 if !a.conns.is_empty() {
                     s += "\nWhere it connected\n";
                     for c in a.conns.iter().take(30) {
@@ -522,7 +599,8 @@ impl Report<'_> {
                             Some(n) => format!("{n} ({})", c.ip),
                             None => c.ip.clone(),
                         };
-                        s += &format!("   {dest} port {} {}  by {}\n", c.port, c.proto, a.who(c.pid, i64::MAX));
+                        let bytes = if c.sent + c.received > 0 { format!(" · sent {}, received {}", kb(c.sent), kb(c.received)) } else { String::new() };
+                        s += &format!("   {dest} port {} {}{bytes}  by {}\n", c.port, c.proto, a.who(c.pid, i64::MAX));
                     }
                     if a.conns.len() > 30 {
                         s += &format!("   and {} more\n", a.conns.len() - 30);
@@ -610,12 +688,12 @@ mod tests {
             Canary {
                 path: ".ssh/id_ed25519".into(),
                 what: "SSH private key",
-                group: crate::canary::PRIVATE,
+                group: crate::canary::PRIVATE, mark: String::new(),
             },
             Canary {
                 path: ".aws/credentials".into(),
                 what: "AWS access keys",
-                group: crate::canary::DEV,
+                group: crate::canary::DEV, mark: String::new(),
             },
         ];
         let home = touches(&[
@@ -664,10 +742,10 @@ mod tests {
             f(Kind::Secret, "~/.config/BraveSoftware/Brave-Browser/Default/Login Data", crate::canary::PASSWORDS),
             f(Kind::Persistence, "/etc/cron.d/x", ""),
         ];
-        let s = in_short(&findings, None);
+        let s = in_short(&findings, None, &[]);
         assert!(s.contains("It went through your crypto wallets, passwords and browser logins: 2 bait files."), "{s}");
         assert!(s.contains("run again on its own (1 way)") && s.contains("new wallet") && s.contains("/etc/cron.d/x"), "{s}");
-        assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None).contains("Nothing alarming"));
+        assert!(in_short(&[f(Kind::Other, "/tmp/x", "")], None, &[]).contains("Nothing alarming"));
     }
 
     #[test]
@@ -695,7 +773,7 @@ mod tests {
     #[test]
     fn a_tool_reading_its_own_settings_is_not_a_theft_but_anything_else_is() {
         use serde_json::json;
-        let canaries = vec![Canary { path: ".npmrc".into(), what: "npm publish token", group: crate::canary::DEV }];
+        let canaries = vec![Canary { path: ".npmrc".into(), what: "npm publish token", group: crate::canary::DEV, mark: String::new() }];
         let home = touches(&[(".npmrc", &[Op::Open, Op::Read])]);
         let run_with = |events: Vec<serde_json::Value>, sys: &FsDiff| {
             let a = Activity::from_events(&events, false);
@@ -709,7 +787,7 @@ mod tests {
         let f = run(vec![npm.clone(), read(10)]);
         assert_eq!(f[0].kind, Kind::Other, "{f:?}");
         assert_eq!(f[0].why, "npm publish token, read by its own tool: npm");
-        assert!(in_short(&f, None).contains("It read one of its own settings (~/.npmrc)"));
+        assert!(in_short(&f, None, &[]).contains("It read one of its own settings (~/.npmrc)"));
         // the classic attack: an install script, not npm, reads the token
         let postinstall = json!({"kind":"exec","t":2,"pid":11,"ppid":10,"comm":"node","file":"/usr/local/bin/node","args":["node","install.js"]});
         let f = run(vec![npm.clone(), postinstall, read(10), read(11)]);
@@ -727,4 +805,19 @@ mod tests {
         let f = run_with(vec![spoof, read(12)], &dropped);
         assert!(f.iter().any(|f| f.path == "~/.npmrc" && f.kind == Kind::Secret), "{f:?}");
     }
+
+    #[test]
+    fn a_leak_names_the_secret_even_base64_encoded() {
+        let cans = vec![
+            Canary { path: ".aws/credentials".into(), what: "AWS access keys", group: crate::canary::DEV, mark: "0123456789abcdef01".into() },
+            Canary { path: ".ssh/id_ed25519".into(), what: "SSH private key", group: crate::canary::PRIVATE, mark: "0123456789abcdef00".into() },
+        ];
+        let leak = |excerpt: &str| Leak { pid: 1, ip: "1.2.3.4".into(), port: 443, name: Some("evil.example".into()), pattern: 0, excerpt: excerpt.into() };
+        assert_eq!(leaked(&cans, &leak("key=AKIA0123456789ABCDEF01&x")).unwrap().what, "AWS access keys");
+        // "b3BlbnNzaC...": base64 of a line holding the SSH bait's mark, at an odd offset
+        let b64 = crate::canary::tests_base64(b"xx-----BEGIN 0123456789abcdef00chouf");
+        assert_eq!(leaked(&cans, &leak(&format!("data={b64}"))).unwrap().what, "SSH private key");
+        assert!(leaked(&cans, &leak("nothing here")).is_none());
+    }
 }
+
